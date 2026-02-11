@@ -38,9 +38,11 @@ class TradingEngine:
         self.trade_size = trade_size
 
         # Streamers
-        self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
+        # self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
+        self.price_streamer = BinanceStreamer(["BTC"])
         self.orderbook_streamer = OrderbookStreamer()
-        self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
+        # self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
+        self.futures_streamer = FuturesStreamer(["BTC"])
 
         # State
         self.markets: Dict[str, Market] = {}
@@ -67,7 +69,8 @@ class TradingEngine:
         print(f"STRATEGY: {self.strategy.name.upper()}")
         print("=" * 60)
 
-        markets = get_15m_markets(assets=["BTC", "ETH", "SOL", "XRP"])
+        # markets = get_15m_markets(assets=["BTC", "ETH", "SOL", "XRP"])
+        markets = get_15m_markets(assets=["BTC"])
         now = datetime.now(timezone.utc)
 
         # Clear stale data
