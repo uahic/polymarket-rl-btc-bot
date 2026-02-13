@@ -15,6 +15,7 @@ from structures.market import MarketState
 from structures.action import Action
 from structures.position import Position
 from streams.polymarket_api import Market, get_15m_markets
+from config import Config
 
 # Dashboard integration (optional)
 try:
@@ -33,7 +34,7 @@ class TradingEngine:
     Paper trading engine with strategy harness.
     """
 
-    def __init__(self, strategy: BaseStrategy, trade_size: float = 10.0):
+    def __init__(self, strategy: BaseStrategy, config: Config, trade_size: float = 10.0 ):
         self.strategy = strategy
         self.trade_size = trade_size
 
@@ -43,6 +44,13 @@ class TradingEngine:
         self.orderbook_streamer = OrderbookStreamer()
         # self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
         self.futures_streamer = FuturesStreamer(["BTC"])
+
+        # Transactions
+        # Initialize components
+        self.signer: Optional[OrderSigner] = None
+        self.clob_client: Optional[ClobClient] = None
+        self.relayer_client: Optional[RelayerClient] = None
+        self._api_creds: Optional[ApiCredentials] = None
 
         # State
         self.markets: Dict[str, Market] = {}
@@ -244,6 +252,108 @@ class TradingEngine:
                     pos.size = 0
                     pos.side = None
 
+    def update_state(self, cid: str, m: Market, state: MarketState, time_now: datetime):
+
+        # Update state from orderbook - CRITICAL for 15-min
+        ob = self.orderbook_streamer.get_orderbook(cid, "UP")
+        if ob and ob.mid_price:
+            state.prob = ob.mid_price
+            state.prob_history.append(ob.mid_price)
+            if len(state.prob_history) > 100:
+                state.prob_history = state.prob_history[-100:]
+            state.best_bid = ob.best_bid or 0.0
+            state.best_ask = ob.best_ask or 0.0
+            state.spread = ob.spread or 0.0
+
+            # Orderbook imbalance - L1 (top of book)
+            if ob.bids and ob.asks:
+                bid_vol_l1 = ob.bids[0][1] if ob.bids else 0
+                ask_vol_l1 = ob.asks[0][1] if ob.asks else 0
+                total_l1 = bid_vol_l1 + ask_vol_l1
+                state.order_book_imbalance_l1 = (
+                    (bid_vol_l1 - ask_vol_l1) / total_l1
+                    if total_l1 > 0
+                    else 0.0
+                )
+
+                # Orderbook imbalance - L5 (depth)
+                bid_vol_l5 = sum(size for _, size in ob.bids[:5])
+                ask_vol_l5 = sum(size for _, size in ob.asks[:5])
+                total_l5 = bid_vol_l5 + ask_vol_l5
+                state.order_book_imbalance_l5 = (
+                    (bid_vol_l5 - ask_vol_l5) / total_l5
+                    if total_l5 > 0
+                    else 0.0
+                )
+
+        # Update binance price
+        binance_price = self.price_streamer.get_price(m.asset)
+        state.binance_price = binance_price
+        open_price = self.open_prices.get(cid, binance_price)
+        if open_price > 0:
+            state.binance_change = (binance_price - open_price) / open_price
+
+        # Update futures data (focused on fast-updating features)
+        futures = self.futures_streamer.get_state(m.asset)
+        if futures:
+            # Order flow - THE EDGE
+            old_cvd = state.cvd
+            state.cvd = futures.cvd
+            state.cvd_acceleration = (
+                (futures.cvd - old_cvd) / 1e6 if old_cvd != 0 else 0.0
+            )
+            state.trade_flow_imbalance = futures.trade_flow_imbalance
+
+            # Ultra-short momentum
+            state.returns_1m = futures.returns_1m
+            state.returns_5m = futures.returns_5m
+            state.returns_10m = (
+                futures.returns_10m
+            )  # Properly computed from klines
+
+            # Microstructure - CRITICAL for 15-min
+            state.trade_intensity = futures.trade_intensity
+            state.large_trade_flag = futures.large_trade_flag
+
+            # Volatility
+            state.realized_vol_5m = (
+                futures.realized_vol_1h / 3.5
+                if futures.realized_vol_1h > 0
+                else 0.0
+            )
+            state.vol_expansion = futures.vol_ratio - 1.0
+
+            # Regime context (slow but useful for context)
+            state.vol_regime = 1.0 if futures.realized_vol_1h > 0.01 else 0.0
+            state.trend_regime = 1.0 if abs(futures.returns_1h) > 0.005 else 0.0
+
+        # Time remaining - CRITICAL
+        state.time_remaining = (m.end_time - time_now).total_seconds() / 900
+
+        # Update position info in state
+        pos = self.positions.get(cid)
+        if pos and pos.size > 0:
+            state.has_position = True
+            state.position_side = pos.side
+            shares = pos.size / pos.entry_price
+            if pos.side == "UP":
+                state.position_pnl = (state.prob - pos.entry_price) * shares
+            else:
+                current_down_price = 1 - state.prob
+                state.position_pnl = (
+                    current_down_price - pos.entry_price
+                ) * shares
+        else:
+            state.has_position = False
+            state.position_side = None
+            state.position_pnl = 0.0
+
+        # Update last own transactions
+        # TODO implement updates on this
+        state.last_action_status = "none"
+        state.pending_order_age = 0.0
+        state.consecutive_failures = 0
+
     async def decision_loop(self):
         """Main trading loop."""
         tick = 0
@@ -293,99 +403,7 @@ class TradingEngine:
                 if not state:
                     continue
 
-                # Update state from orderbook - CRITICAL for 15-min
-                ob = self.orderbook_streamer.get_orderbook(cid, "UP")
-                if ob and ob.mid_price:
-                    state.prob = ob.mid_price
-                    state.prob_history.append(ob.mid_price)
-                    if len(state.prob_history) > 100:
-                        state.prob_history = state.prob_history[-100:]
-                    state.best_bid = ob.best_bid or 0.0
-                    state.best_ask = ob.best_ask or 0.0
-                    state.spread = ob.spread or 0.0
-
-                    # Orderbook imbalance - L1 (top of book)
-                    if ob.bids and ob.asks:
-                        bid_vol_l1 = ob.bids[0][1] if ob.bids else 0
-                        ask_vol_l1 = ob.asks[0][1] if ob.asks else 0
-                        total_l1 = bid_vol_l1 + ask_vol_l1
-                        state.order_book_imbalance_l1 = (
-                            (bid_vol_l1 - ask_vol_l1) / total_l1
-                            if total_l1 > 0
-                            else 0.0
-                        )
-
-                        # Orderbook imbalance - L5 (depth)
-                        bid_vol_l5 = sum(size for _, size in ob.bids[:5])
-                        ask_vol_l5 = sum(size for _, size in ob.asks[:5])
-                        total_l5 = bid_vol_l5 + ask_vol_l5
-                        state.order_book_imbalance_l5 = (
-                            (bid_vol_l5 - ask_vol_l5) / total_l5
-                            if total_l5 > 0
-                            else 0.0
-                        )
-
-                # Update binance price
-                binance_price = self.price_streamer.get_price(m.asset)
-                state.binance_price = binance_price
-                open_price = self.open_prices.get(cid, binance_price)
-                if open_price > 0:
-                    state.binance_change = (binance_price - open_price) / open_price
-
-                # Update futures data (focused on fast-updating features)
-                futures = self.futures_streamer.get_state(m.asset)
-                if futures:
-                    # Order flow - THE EDGE
-                    old_cvd = state.cvd
-                    state.cvd = futures.cvd
-                    state.cvd_acceleration = (
-                        (futures.cvd - old_cvd) / 1e6 if old_cvd != 0 else 0.0
-                    )
-                    state.trade_flow_imbalance = futures.trade_flow_imbalance
-
-                    # Ultra-short momentum
-                    state.returns_1m = futures.returns_1m
-                    state.returns_5m = futures.returns_5m
-                    state.returns_10m = (
-                        futures.returns_10m
-                    )  # Properly computed from klines
-
-                    # Microstructure - CRITICAL for 15-min
-                    state.trade_intensity = futures.trade_intensity
-                    state.large_trade_flag = futures.large_trade_flag
-
-                    # Volatility
-                    state.realized_vol_5m = (
-                        futures.realized_vol_1h / 3.5
-                        if futures.realized_vol_1h > 0
-                        else 0.0
-                    )
-                    state.vol_expansion = futures.vol_ratio - 1.0
-
-                    # Regime context (slow but useful for context)
-                    state.vol_regime = 1.0 if futures.realized_vol_1h > 0.01 else 0.0
-                    state.trend_regime = 1.0 if abs(futures.returns_1h) > 0.005 else 0.0
-
-                # Time remaining - CRITICAL
-                state.time_remaining = (m.end_time - now).total_seconds() / 900
-
-                # Update position info in state
-                pos = self.positions.get(cid)
-                if pos and pos.size > 0:
-                    state.has_position = True
-                    state.position_side = pos.side
-                    shares = pos.size / pos.entry_price
-                    if pos.side == "UP":
-                        state.position_pnl = (state.prob - pos.entry_price) * shares
-                    else:
-                        current_down_price = 1 - state.prob
-                        state.position_pnl = (
-                            current_down_price - pos.entry_price
-                        ) * shares
-                else:
-                    state.has_position = False
-                    state.position_side = None
-                    state.position_pnl = 0.0
+                self.update_state(cid, m, state, now)
 
                 # For non-RL strategies, force close near expiry as safety
                 # For RL, let it learn to close on its own (gets penalty at expiry)

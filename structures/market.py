@@ -47,6 +47,11 @@ class MarketState:
     trade_count: int = 0  # For intensity calc
     last_trade_time: float = 0.0
 
+    # Own Transactions
+    last_action_status: str = "none"  # "none", "pending", "success", "failed"
+    pending_order_age: float = 0.0  # Time since order placed (0-1, normalized)
+    consecutive_failures: int = 0  # Track repeated failures
+
     # Volatility (short-term)
     realized_vol_5m: float = 0.0
     vol_expansion: float = 0.0  # Current vol vs recent average
@@ -98,6 +103,11 @@ class MarketState:
             # Regime (2)
             self.vol_regime,  # 0 or 1
             self.trend_regime,  # 0 or 1
+
+            # Own Transactions (3)
+            float(1.0 if self.last_action_status == "pending" else 0.0),
+            float(1.0 if self.last_action_status == "failed" else 0.0),
+            clamp(self.consecutive_failures / 5.0),  # Normalize by max expected failures
         ], dtype=np.float32)
 
     def _velocity(self, window: int = 5) -> float:
