@@ -166,6 +166,9 @@ class Config:
     # Logging
     log_level: str = "INFO"
 
+    # Trading mode
+    order_type: str = "GTC"  # "GTC" or "FOK"
+
     # Auto-configure for gasless mode (auto-detected based on builder credentials)
     use_gasless: bool = False
 
@@ -327,6 +330,11 @@ class Config:
         default_price = get_env_float("DEFAULT_PRICE")
         if default_price:
             config.default_price = default_price
+
+        # Trading mode
+        order_type = get_env("ORDER_TYPE", "GTC")
+        if order_type in ("GTC", "FOK"):
+            config.order_type = order_type
 
         # Auto-detect gasless mode
         config.use_gasless = config.builder.is_configured()

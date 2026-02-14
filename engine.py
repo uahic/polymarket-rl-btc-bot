@@ -3,30 +3,51 @@ import sys
 import copy
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, List
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from logger.training_logger import get_logger
+from config import Config
 from strategies import BaseStrategy, MLStrategy
 from streams.binance import BinanceStreamer
 from streams.orderbook import OrderbookStreamer
 from streams.binance_futures import FuturesStreamer
+from streams.polymarket_api import Market, get_15m_markets
 from structures.market import MarketState
 from structures.action import Action
 from structures.position import Position
-from streams.polymarket_api import Market, get_15m_markets
-from config import Config
+from structures.order import Order, OrderSide
+from security.order_signer import OrderSigner
+from config_loader import decrypt_private_key
+from transactions.transaction_client import TransactionClient
+from transactions.async_http import OrderError
 
 # Dashboard integration (optional)
 try:
-    from dashboard.flask_dashboard import update_dashboard_state, update_rl_metrics, emit_rl_buffer, run_dashboard, emit_trade
+    from dashboard.flask_dashboard import (
+        update_dashboard_state,
+        update_rl_metrics,
+        emit_rl_buffer,
+        run_dashboard,
+        emit_trade,
+    )
+
     DASHBOARD_AVAILABLE = True
 except ImportError:
     DASHBOARD_AVAILABLE = False
-    def update_dashboard_state(**kwargs): pass
-    def update_rl_metrics(metrics): pass
-    def emit_rl_buffer(buffer_size, max_buffer=256, avg_reward=None): pass
-    def emit_trade(action, asset, size=0, pnl=None): pass
+
+    def update_dashboard_state(**kwargs):
+        pass
+
+    def update_rl_metrics(metrics):
+        pass
+
+    def emit_rl_buffer(buffer_size, max_buffer=256, avg_reward=None):
+        pass
+
+    def emit_trade(action, asset, size=0, pnl=None):
+        pass
 
 
 class TradingEngine:
@@ -34,9 +55,17 @@ class TradingEngine:
     Paper trading engine with strategy harness.
     """
 
-    def __init__(self, strategy: BaseStrategy, config: Config, trade_size: float = 10.0 ):
+    def __init__(
+        self,
+        strategy: BaseStrategy,
+        config: Config,
+        trade_size: float = 10.0,
+        live_trading: bool = False,
+    ):
         self.strategy = strategy
         self.trade_size = trade_size
+        self.config = config
+        self.live_trading = live_trading
 
         # Streamers
         # self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
@@ -45,12 +74,37 @@ class TradingEngine:
         # self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
         self.futures_streamer = FuturesStreamer(["BTC"])
 
-        # Transactions
-        # Initialize components
-        self.signer: Optional[OrderSigner] = None
-        self.clob_client: Optional[ClobClient] = None
-        self.relayer_client: Optional[RelayerClient] = None
-        self._api_creds: Optional[ApiCredentials] = None
+        # Order management (initialized only if live_trading=True)
+        self.order_signer: Optional[OrderSigner] = None
+        self.transaction_client: Optional[TransactionClient] = None
+
+        # Order tracking
+        self.pending_orders: Dict[str, Dict[str, Any]] = (
+            {}
+        )  # cid -> {order_id, side, size, price}
+        self.order_timestamps: Dict[str, float] = {}  # cid -> unix_timestamp
+        self.order_type: str = "GTC"  # "GTC" or "FOK"
+
+        # Initialize live trading components
+        if self.live_trading:
+            # Load private key and initialize signer
+            private_key = decrypt_private_key()
+            self.order_signer = OrderSigner(private_key)
+
+            # Initialize async CLOB client
+            # Use checksummed address from signer for consistency with API credentials
+            self.transaction_client = TransactionClient(
+                host=config.clob.host,
+                chain_id=config.clob.chain_id,
+                signature_type=config.clob.signature_type,
+                funder=self.order_signer.address,  # Use checksummed address
+                builder_creds=(
+                    config.builder if config.builder.is_configured() else None
+                ),
+            )
+
+            self.order_type = getattr(config, "order_type", "GTC")
+            print(f"[LIVE TRADING] Mode enabled, using {self.order_type} orders")
 
         # State
         self.markets: Dict[str, Market] = {}
@@ -120,10 +174,19 @@ class TradingEngine:
             self.orderbook_streamer.clear_stale(active_cids)
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
-        """Execute paper trade with flexible sizing."""
+        """Execute action - paper or live based on mode."""
         if action == Action.HOLD:
             return
 
+        if self.live_trading:
+            # Schedule async live order execution
+            asyncio.create_task(self._execute_action_live(cid, action, state))
+        else:
+            # Keep existing paper trading logic
+            self._execute_action_paper(cid, action, state)
+
+    def _execute_action_paper(self, cid: str, action: Action, state: MarketState):
+        """Execute paper trade with flexible sizing."""
         pos = self.positions.get(cid)
         if not pos:
             return
@@ -183,6 +246,193 @@ class TradingEngine:
                     f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {1 - price:.3f}"
                 )
                 emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
+
+    async def _execute_action_live(self, cid: str, action: Action, state: MarketState):
+        """Execute live order via CLOB API."""
+        try:
+            pos = self.positions.get(cid)
+            m = self.markets.get(cid)
+            if not pos or not m:
+                return
+
+            # Cancel pending orders first if switching sides
+            if cid in self.pending_orders:
+                await self._cancel_pending_order(cid)
+
+            price = state.prob
+            trade_amount = self.trade_size * action.size_multiplier
+
+            # Close position if switching sides
+            if pos.size > 0:
+                if (action.is_sell and pos.side == "UP") or (
+                    action.is_buy and pos.side == "DOWN"
+                ):
+                    # Close existing position first
+                    # If this fails, exception bubbles up and we skip opening new position
+                    await self._close_position_live(cid, pos, state, pos.side)
+                    # Position is now closed (pos.size = 0)
+
+            # Open new position (only if we're flat)
+            # This runs after successful close OR if we had no position
+            if pos.size == 0:
+                await self._open_position_live(cid, action, state, trade_amount, m)
+            else:
+                # Position still open (same side, add to existing?)
+                # For now, skip - strategy shouldn't double down without closing first
+                print(
+                    f"    [SKIP] Position already open on {pos.side}, action wants same side"
+                )
+
+        except OrderError as e:
+            print(f"  [ORDER ERROR] {m.asset}: {e}")
+            self._handle_order_failure(cid, str(e))
+        except Exception as e:
+            print(f"  [ERROR] {m.asset}: {e}")
+            self._handle_order_failure(cid, str(e))
+
+    async def _open_position_live(
+        self,
+        cid: str,
+        action: Action,
+        state: MarketState,
+        trade_amount: float,
+        market: Market,
+    ):
+        """Open new position with live order."""
+
+        # Determine token and side
+        if action.is_buy:
+            token_id = market.token_up
+            side = OrderSide.BUY
+            price = state.prob
+            position_side = "UP"
+        else:  # action.is_sell
+            token_id = market.token_down
+            side = OrderSide.BUY  # Buy DOWN token
+            price = 1 - state.prob
+            position_side = "DOWN"
+
+        # Calculate shares
+        size = trade_amount / price
+
+        # Sign and submit order
+        signed_order = self.order_signer.sign_order_dict(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=side,
+            maker=self.config.safe_address,
+            nonce=None,
+            fee_rate_bps=0,
+        )
+
+        response = await self.transaction_client.post_order(
+            signed_order=signed_order, order_type=self.order_type
+        )
+
+        # Track order if GTC
+        if self.order_type == "GTC":
+            order_id = response.get("orderID")
+            if order_id:
+                self.pending_orders[cid] = {
+                    "order_id": order_id,
+                    "side": position_side,
+                    "size": trade_amount,
+                    "price": price,
+                }
+                self.order_timestamps[cid] = datetime.now(timezone.utc).timestamp()
+
+        # Update position (optimistic)
+        pos = self.positions[cid]
+        pos.side = position_side
+        pos.size = trade_amount
+        pos.entry_price = price
+        pos.entry_time = datetime.now(timezone.utc)
+        pos.entry_prob = state.prob
+        pos.time_remaining_at_entry = state.time_remaining
+
+        size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(action.size_multiplier, "")
+        print(
+            f"    [LIVE] OPEN {market.asset} {position_side} ({size_label}) ${trade_amount:.0f} @ {price:.3f}"
+        )
+        emit_trade(f"BUY_{size_label}", market.asset, trade_amount)
+
+        # Update state
+        state.last_action_status = "pending" if self.order_type == "GTC" else "success"
+        state.consecutive_failures = 0
+
+    async def _close_position_live(
+        self, cid: str, pos: Position, state: MarketState, side: str
+    ):
+        """Close position by selling tokens."""
+        m = self.markets[cid]
+
+        # Determine token and price
+        token_id = m.token_up if side == "UP" else m.token_down
+        exit_price = state.prob if side == "UP" else (1 - state.prob)
+
+        # Calculate shares
+        shares = pos.size / pos.entry_price
+
+        # Sign and submit SELL order (use FOK for exits)
+        signed_order = self.order_signer.sign_order_dict(
+            token_id=token_id,
+            price=exit_price,
+            size=shares,
+            side=OrderSide.SELL,
+            maker=self.config.safe_address,
+            nonce=None,
+            fee_rate_bps=0,
+        )
+
+        await self.transaction_client.post_order(signed_order, order_type="FOK")
+
+        # Calculate PnL
+        pnl = (exit_price - pos.entry_price) * shares
+
+        # Record and clear position
+        self._record_trade(pos, exit_price, pnl, f"CLOSE {side}", cid=cid)
+        self.pending_rewards[cid] = pnl
+        pos.size = 0
+        pos.side = None
+
+        # Update state
+        state.last_action_status = "success"
+        state.consecutive_failures = 0
+
+    async def _cancel_pending_order(self, cid: str):
+        """Cancel pending GTC order for a market."""
+        if cid not in self.pending_orders:
+            return
+
+        order_id = self.pending_orders[cid].get("order_id")
+        if not order_id:
+            return
+
+        try:
+            await self.transaction_client.cancel_order(order_id)
+            print(f"    [CANCEL] Order {order_id[:8]}... cancelled")
+            del self.pending_orders[cid]
+            if cid in self.order_timestamps:
+                del self.order_timestamps[cid]
+        except Exception as e:
+            print(f"    [CANCEL ERROR] {order_id[:8]}...: {e}")
+
+    def _handle_order_failure(self, cid: str, error_msg: str):
+        """Handle order failure - fail fast strategy."""
+        state = self.states.get(cid)
+        if state:
+            state.last_action_status = "failed"
+            state.consecutive_failures += 1
+            print(
+                f"    [FAILURE] {error_msg} (consecutive: {state.consecutive_failures})"
+            )
+
+    async def _cancel_expired_orders(self, expired_cids: List[str]):
+        """Cancel pending orders for expired markets."""
+        for cid in expired_cids:
+            if cid in self.pending_orders:
+                await self._cancel_pending_order(cid)
 
     def _record_trade(
         self, pos: Position, price: float, pnl: float, action: str, cid: str = None
@@ -252,6 +502,18 @@ class TradingEngine:
                     pos.size = 0
                     pos.side = None
 
+    async def close_all_positions_async(self):
+        """Close all positions asynchronously for live trading."""
+        tasks = []
+        for cid, pos in self.positions.items():
+            if pos.size > 0:
+                state = self.states.get(cid)
+                if state:
+                    tasks.append(self._close_position_live(cid, pos, state, pos.side))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def update_state(self, cid: str, m: Market, state: MarketState, time_now: datetime):
 
         # Update state from orderbook - CRITICAL for 15-min
@@ -271,9 +533,7 @@ class TradingEngine:
                 ask_vol_l1 = ob.asks[0][1] if ob.asks else 0
                 total_l1 = bid_vol_l1 + ask_vol_l1
                 state.order_book_imbalance_l1 = (
-                    (bid_vol_l1 - ask_vol_l1) / total_l1
-                    if total_l1 > 0
-                    else 0.0
+                    (bid_vol_l1 - ask_vol_l1) / total_l1 if total_l1 > 0 else 0.0
                 )
 
                 # Orderbook imbalance - L5 (depth)
@@ -281,9 +541,7 @@ class TradingEngine:
                 ask_vol_l5 = sum(size for _, size in ob.asks[:5])
                 total_l5 = bid_vol_l5 + ask_vol_l5
                 state.order_book_imbalance_l5 = (
-                    (bid_vol_l5 - ask_vol_l5) / total_l5
-                    if total_l5 > 0
-                    else 0.0
+                    (bid_vol_l5 - ask_vol_l5) / total_l5 if total_l5 > 0 else 0.0
                 )
 
         # Update binance price
@@ -307,9 +565,7 @@ class TradingEngine:
             # Ultra-short momentum
             state.returns_1m = futures.returns_1m
             state.returns_5m = futures.returns_5m
-            state.returns_10m = (
-                futures.returns_10m
-            )  # Properly computed from klines
+            state.returns_10m = futures.returns_10m  # Properly computed from klines
 
             # Microstructure - CRITICAL for 15-min
             state.trade_intensity = futures.trade_intensity
@@ -317,9 +573,7 @@ class TradingEngine:
 
             # Volatility
             state.realized_vol_5m = (
-                futures.realized_vol_1h / 3.5
-                if futures.realized_vol_1h > 0
-                else 0.0
+                futures.realized_vol_1h / 3.5 if futures.realized_vol_1h > 0 else 0.0
             )
             state.vol_expansion = futures.vol_ratio - 1.0
 
@@ -340,19 +594,30 @@ class TradingEngine:
                 state.position_pnl = (state.prob - pos.entry_price) * shares
             else:
                 current_down_price = 1 - state.prob
-                state.position_pnl = (
-                    current_down_price - pos.entry_price
-                ) * shares
+                state.position_pnl = (current_down_price - pos.entry_price) * shares
         else:
             state.has_position = False
             state.position_side = None
             state.position_pnl = 0.0
 
-        # Update last own transactions
-        # TODO implement updates on this
-        state.last_action_status = "none"
-        state.pending_order_age = 0.0
-        state.consecutive_failures = 0
+        # Update order status tracking
+        if cid in self.pending_orders and cid in self.order_timestamps:
+            # Calculate pending order age (normalized to 0-1, max 15 min)
+            age_seconds = (
+                datetime.now(timezone.utc).timestamp() - self.order_timestamps[cid]
+            )
+            state.pending_order_age = min(age_seconds / 900, 1.0)
+
+            # Auto-cancel stale orders (>5 min) for high-frequency trading
+            if age_seconds > 300 and self.live_trading:
+                # Schedule as fire-and-forget task (update_state is NOT async)
+                asyncio.create_task(self._cancel_pending_order(cid))
+        elif state.last_action_status == "pending":
+            # Order filled or cancelled
+            state.last_action_status = "success"
+            state.pending_order_age = 0.0
+
+        # consecutive_failures updated in _handle_order_failure
 
     async def decision_loop(self):
         """Main trading loop."""
@@ -365,6 +630,11 @@ class TradingEngine:
 
             # Check expired markets
             expired = [cid for cid, m in self.markets.items() if m.end_time <= now]
+
+            # Cancel pending orders for expired markets
+            if self.live_trading and expired:
+                await self._cancel_expired_orders(expired)
+
             for cid in expired:
                 print(f"\n  EXPIRED: {self.markets[cid].asset}")
 
@@ -390,7 +660,10 @@ class TradingEngine:
 
             if not self.markets:
                 print("\nAll markets expired. Refreshing...")
-                self.close_all_positions()
+                if self.live_trading:
+                    await self.close_all_positions_async()
+                else:
+                    self.close_all_positions()
                 self.refresh_markets()
                 if not self.markets:
                     print("No new markets. Waiting...")
@@ -404,6 +677,7 @@ class TradingEngine:
                     continue
 
                 self.update_state(cid, m, state, now)
+                pos = self.positions.get(cid)
 
                 # For non-RL strategies, force close near expiry as safety
                 # For RL, let it learn to close on its own (gets penalty at expiry)
@@ -577,6 +851,22 @@ class TradingEngine:
     async def run(self):
         """Run the trading engine."""
         self.running = True
+
+        # Derive API credentials for authenticated endpoints
+        print(f"[DEBUG] live_trading={self.live_trading}, transaction_client={self.transaction_client is not None}")
+        if self.live_trading and self.transaction_client:
+            print("[AUTH] Deriving L2 API credentials...")
+            try:
+                api_creds = await self.transaction_client.derive_l2_api_credentials(
+                    self.order_signer
+                )
+                self.transaction_client.set_api_credentials(api_creds)
+                print("[AUTH] ✓ API credentials configured")
+            except Exception as e:
+                print(f"[AUTH ERROR] Failed to derive credentials: {e}")
+                import traceback
+                traceback.print_exc()
+
         self.refresh_markets()
 
         if not self.markets:
@@ -600,7 +890,22 @@ class TradingEngine:
             self.price_streamer.stop()
             self.orderbook_streamer.stop()
             self.futures_streamer.stop()
-            self.close_all_positions()
+
+            # Cancel all pending orders and close client
+            if self.live_trading and self.transaction_client:
+                try:
+                    print("  Cancelling all pending orders...")
+                    await self.transaction_client.cancel_all_orders()
+                    await self.transaction_client.close()
+                except Exception as e:
+                    print(f"  Error during order cleanup: {e}")
+
+            # Close all positions
+            if self.live_trading:
+                await self.close_all_positions_async()
+            else:
+                self.close_all_positions()
+
             self.print_final_stats()
 
             # Save RL model if training

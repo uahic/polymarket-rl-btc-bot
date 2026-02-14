@@ -24,6 +24,30 @@ def print_error(msg: str) -> None:
     print(f"{Colors.RED}✗{Colors.RESET} {msg}")
 
 
+def load_config() -> Config:
+    """Load configuration from config.yaml."""
+    if not os.path.exists("config.yaml"):
+        print_error("config.yaml not found!")
+        print("\nPlease run the setup first:")
+        print(f"  {Colors.CYAN}python scripts/setup.py{Colors.RESET}")
+        sys.exit(1)
+
+    try:
+        config = Config.load("config.yaml")
+        errors = config.validate()
+
+        if errors:
+            print_error("Configuration validation failed:")
+            for error in errors:
+                print(f"  - {error}")
+            sys.exit(1)
+
+        return config
+    except Exception as e:
+        print_error(f"Failed to load config: {e}")
+        sys.exit(1)
+
+
 def get_private_key_from_env() -> str:
     """Get private key from environment variable."""
     private_key = os.environ.get("POLY_PRIVATE_KEY")

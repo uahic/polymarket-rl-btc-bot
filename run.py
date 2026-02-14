@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 from strategies import ALL_STRATEGIES, registry, MLStrategy
-from config_loader import load_config_from_env, get_private_key_from_env
+from config_loader import load_config
 from engine import TradingEngine
 
 
@@ -31,6 +31,7 @@ async def main():
     parser.add_argument("--load", type=str, help="Load RL model from file")
     parser.add_argument("--dashboard", action="store_true", help="Enable web dashboard")
     parser.add_argument("--port", type=int, default=5050, help="Dashboard port")
+    parser.add_argument("--live", action="store_true", help="Enable live trading mode")
 
     args = parser.parse_args()
 
@@ -53,9 +54,14 @@ async def main():
 
     # Auto-load .env file
     load_dotenv()
-    config = load_config_from_env()
-    private_key = get_private_key_from_env()
-    engine = TradingEngine(strategy, trade_size=args.size, config=config)
+    config = load_config()
+    
+    engine = TradingEngine(
+        strategy,
+        trade_size=args.size,
+        config=config,
+        live_trading=args.live
+    )
     await engine.run()
 
 

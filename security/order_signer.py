@@ -4,11 +4,12 @@ import secrets
 from pathlib import Path
 from typing import Optional, Dict, Any
 from eth_account import Account
-from eth_account.messages import encode_typed_data, encode_defunct
+from eth_account.messages import encode_typed_data
 from eth_utils import to_checksum_address, is_address
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from structures.order import Order, OrderSide
-from .key_store import EncryptedKeyStore
+
 
 class SignerError(Exception):
     """Base exception for signer operations."""
@@ -19,6 +20,7 @@ class SignerError(Exception):
 class OrderSigner:
     """
     Signs Polymarket orders using EIP-712.
+    This is used to derive L2 credentials which can be used in the TransactionClient
 
     This signer handles:
     - Authentication messages (L1)
@@ -75,26 +77,6 @@ class OrderSigner:
 
         self.address = self.wallet.address
 
-    @classmethod
-    def from_encrypted(cls, encrypted_data: dict, password: str) -> "OrderSigner":
-        """
-        Create signer from encrypted private key.
-
-        Args:
-            encrypted_data: Encrypted key data
-            password: Decryption password
-
-        Returns:
-            Configured OrderSigner instance
-
-        Raises:
-            InvalidPasswordError: If password is incorrect
-        """
-
-        manager = EncryptedKeyStore()
-        private_key = manager.decrypt(encrypted_data, password)
-        return cls(private_key)
-
     def sign_auth_message(self, timestamp: Optional[str] = None, nonce: int = 0) -> str:
         """
         Sign an authentication message for L1 authentication.
@@ -136,7 +118,10 @@ class OrderSigner:
         return "0x" + signed.signature.hex()
 
     def sign_order(
-        self, order: Order, expiration: Optional[int] = None, taker: Optional[str] = None
+        self,
+        order: Order,
+        expiration: Optional[int] = None,
+        taker: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Sign a Polymarket order.
@@ -169,13 +154,15 @@ class OrderSigner:
                 maker_amount_int = int(order.maker_amount)
                 taker_amount_int = int(order.taker_amount)
                 if maker_amount_int <= 0 or taker_amount_int <= 0:
-                    raise ValueError(f"Amounts must be positive: maker={maker_amount_int}, taker={taker_amount_int}")
+                    raise ValueError(
+                        f"Amounts must be positive: maker={maker_amount_int}, taker={taker_amount_int}"
+                    )
             except (ValueError, TypeError) as e:
                 raise ValueError(f"Order amounts must be numeric") from e
 
-            # Set default expiration to 1 second from now if not specified
+            # Set default expiration to 30 seconds from now if not specified
             if expiration is None:
-                expiration = int(time.time()) + 1
+                expiration = int(time.time()) + 30
 
             # Set default taker to zero address if not specified
             if taker is None:
@@ -215,17 +202,20 @@ class OrderSigner:
 
             return {
                 "order": {
+                    "salt": salt,
+                    "maker": to_checksum_address(order.maker),
+                    "signer": self.address,
+                    "taker": taker,
                     "tokenId": order.token_id,
-                    "price": order.price,
-                    "size": order.size,
-                    "side": order.side,
-                    "maker": order.maker,
-                    "nonce": order.nonce,
-                    "feeRateBps": order.fee_rate_bps,
-                    "signatureType": order.signature_type,
+                    "makerAmount": order.maker_amount,
+                    "takerAmount": order.taker_amount,
+                    "expiration": str(expiration),
+                    "nonce": str(order.nonce),
+                    "feeRateBps": str(order.fee_rate_bps),
+                    "side": str(order.side_value),
+                    "signatureType": str(order.signature_type),
                 },
                 "signature": "0x" + signed.signature.hex(),
-                "signer": self.address,
             }
 
         except SignerError:
@@ -285,7 +275,9 @@ class OrderSigner:
             raise ValueError(f"maker must be a valid Ethereum address, got {maker}")
 
         if not isinstance(fee_rate_bps, int) or not (0 <= fee_rate_bps <= 10000):
-            raise ValueError(f"fee_rate_bps must be an integer between 0-10000, got {fee_rate_bps}")
+            raise ValueError(
+                f"fee_rate_bps must be an integer between 0-10000, got {fee_rate_bps}"
+            )
 
         order = Order(
             token_id=token_id,
@@ -297,18 +289,3 @@ class OrderSigner:
             fee_rate_bps=fee_rate_bps,
         )
         return self.sign_order(order, expiration=expiration, taker=taker)
-
-    def sign_message(self, message: str) -> str:
-        """
-        Sign a plain text message (for API key derivation).
-
-        Args:
-            message: Plain text message to sign
-
-        Returns:
-            Hex-encoded signature
-        """
-
-        signable = encode_defunct(text=message)
-        signed = self.wallet.sign_message(signable)
-        return "0x" + signed.signature.hex()

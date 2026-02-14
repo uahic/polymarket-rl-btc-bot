@@ -183,9 +183,16 @@ class AsyncApiClient:
                     except aiohttp.ContentTypeError:
                         # Response is not JSON
                         text = await response.text()
-                        if text:
-                            return {"response": text}
-                        return {}
+                        return {"response": text} if text else {}
+
+            except aiohttp.ClientResponseError as e:
+                last_error = e
+                if attempt < self.retry_count - 1:
+                    # Exponential backoff
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    # Last attempt - raise with details
+                    raise ApiError(f"Request failed: {e.status} {e.message}")
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_error = e
@@ -251,6 +258,28 @@ class AsyncClobClient(AsyncApiClient):
         self.api_creds = api_creds
         self.builder_creds = builder_creds
 
+    def _build_hmac_signature(
+        self,
+        secret: bytes,
+        message: str,
+        output_format: str = "base64"
+    ) -> str:
+        """
+        Build HMAC-SHA256 signature.
+
+        Args:
+            secret: Secret key as bytes
+            message: Message to sign
+            output_format: "base64" or "hex"
+
+        Returns:
+            Signature as string
+        """
+        signature = hmac.new(secret, message.encode(), hashlib.sha256)
+        if output_format == "base64":
+            return base64.b64encode(signature.digest()).decode()
+        return signature.hexdigest()
+
     def _build_headers(
         self,
         method: str,
@@ -265,23 +294,22 @@ class AsyncClobClient(AsyncApiClient):
         Args:
             method: HTTP method
             path: Request path
-            body: Request body
+            body: Request body (JSON string)
 
         Returns:
             Dictionary of headers
         """
         headers = {}
+        timestamp = str(int(time.time()))
 
-        # Builder HMAC authentication
+        # Builder HMAC authentication (uses hex encoding)
         if self.builder_creds and self.builder_creds.is_configured():
-            timestamp = str(int(time.time()))
-
             message = f"{timestamp}{method}{path}{body}"
-            signature = hmac.new(
+            signature = self._build_hmac_signature(
                 self.builder_creds.api_secret.encode(),
-                message.encode(),
-                hashlib.sha256
-            ).hexdigest()
+                message,
+                output_format="hex"
+            )
 
             headers.update({
                 "POLY_BUILDER_API_KEY": self.builder_creds.api_key,
@@ -290,27 +318,17 @@ class AsyncClobClient(AsyncApiClient):
                 "POLY_BUILDER_SIGNATURE": signature,
             })
 
-        # User API credentials (L2 authentication)
+        # User API credentials (L2 authentication - uses base64 encoding)
         if self.api_creds and self.api_creds.is_valid():
-            timestamp = str(int(time.time()))
+            message = f"{timestamp}{method}{path}{body}"
 
-            # Build message: timestamp + method + path + body
-            message = f"{timestamp}{method}{path}"
-            if body:
-                message += body
-
-            # Decode base64 secret and create HMAC signature
-            try:
-                base64_secret = base64.urlsafe_b64decode(self.api_creds.secret)
-                h = hmac.new(base64_secret, message.encode("utf-8"), hashlib.sha256)
-                signature = base64.urlsafe_b64encode(h.digest()).decode("utf-8")
-            except Exception:
-                # Fallback: use secret directly if not base64 encoded
-                signature = hmac.new(
-                    self.api_creds.secret.encode(),
-                    message.encode(),
-                    hashlib.sha256
-                ).hexdigest()
+            # Secret is base64-encoded, must decode before signing
+            secret = base64.b64decode(self.api_creds.secret)
+            signature = self._build_hmac_signature(
+                secret,
+                message,
+                output_format="base64"
+            )
 
             headers.update({
                 "POLY_ADDRESS": self.funder,
@@ -451,14 +469,9 @@ class AsyncClobClient(AsyncApiClient):
             List of open orders
         """
         endpoint = "/data/orders"
-
         headers = self._build_headers("GET", endpoint)
 
-        result = await self._request(
-            "GET",
-            endpoint,
-            headers=headers
-        )
+        result = await self._request("GET", endpoint, headers=headers)
 
         # Handle paginated response
         if isinstance(result, dict) and "data" in result:
@@ -500,12 +513,7 @@ class AsyncClobClient(AsyncApiClient):
         if token_id:
             params["token_id"] = token_id
 
-        result = await self._request(
-            "GET",
-            endpoint,
-            headers=headers,
-            params=params
-        )
+        result = await self._request("GET", endpoint, headers=headers, params=params)
 
         # Handle paginated response
         if isinstance(result, dict) and "data" in result:
@@ -530,25 +538,23 @@ class AsyncClobClient(AsyncApiClient):
         endpoint = "/order"
 
         # Build request body
+        # Note: signature must be inside the order object per API spec
+        order_obj = signed_order.get("order", signed_order)
+        if "signature" in signed_order:
+            order_obj["signature"] = signed_order["signature"]
+
         body = {
-            "order": signed_order.get("order", signed_order),
+            "order": order_obj,
             "owner": self.funder,
             "orderType": order_type,
         }
 
-        # Add signature
-        if "signature" in signed_order:
-            body["signature"] = signed_order["signature"]
+        # POST /order uses EIP-712 signature within the order itself for authentication
+        # Builder headers are ONLY for attribution, not authentication
+        # Don't send builder headers for now - they may be causing 401 errors
+        headers = None
 
-        body_json = json.dumps(body, separators=(',', ':'))
-        headers = self._build_headers("POST", endpoint, body_json)
-
-        return await self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return await self._request("POST", endpoint, data=body, headers=headers)
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """
@@ -565,12 +571,7 @@ class AsyncClobClient(AsyncApiClient):
         body_json = json.dumps(body, separators=(',', ':'))
         headers = self._build_headers("DELETE", endpoint, body_json)
 
-        return await self._request(
-            "DELETE",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return await self._request("DELETE", endpoint, data=body, headers=headers)
 
     async def cancel_orders(self, order_ids: List[str]) -> Dict[str, Any]:
         """
@@ -586,12 +587,7 @@ class AsyncClobClient(AsyncApiClient):
         body_json = json.dumps(order_ids, separators=(',', ':'))
         headers = self._build_headers("DELETE", endpoint, body_json)
 
-        return await self._request(
-            "DELETE",
-            endpoint,
-            data=order_ids,
-            headers=headers
-        )
+        return await self._request("DELETE", endpoint, data=order_ids, headers=headers)
 
     async def cancel_all_orders(self) -> Dict[str, Any]:
         """
@@ -603,11 +599,7 @@ class AsyncClobClient(AsyncApiClient):
         endpoint = "/cancel-all"
         headers = self._build_headers("DELETE", endpoint)
 
-        return await self._request(
-            "DELETE",
-            endpoint,
-            headers=headers
-        )
+        return await self._request("DELETE", endpoint, headers=headers)
 
     async def cancel_market_orders(
         self,
@@ -635,12 +627,7 @@ class AsyncClobClient(AsyncApiClient):
         body_json = json.dumps(body, separators=(',', ':')) if body else ""
         headers = self._build_headers("DELETE", endpoint, body_json)
 
-        return await self._request(
-            "DELETE",
-            endpoint,
-            data=body if body else None,
-            headers=headers
-        )
+        return await self._request("DELETE", endpoint, data=body if body else None, headers=headers)
 
 
 class AsyncRelayerClient(AsyncApiClient):
@@ -727,12 +714,7 @@ class AsyncRelayerClient(AsyncApiClient):
         body_json = json.dumps(body, separators=(',', ':'))
         headers = self._build_headers("POST", endpoint, body_json)
 
-        return await self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return await self._request("POST", endpoint, data=body, headers=headers)
 
     async def approve_usdc(
         self,
@@ -760,12 +742,7 @@ class AsyncRelayerClient(AsyncApiClient):
         body_json = json.dumps(body, separators=(',', ':'))
         headers = self._build_headers("POST", endpoint, body_json)
 
-        return await self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return await self._request("POST", endpoint, data=body, headers=headers)
 
     async def approve_token(
         self,
@@ -796,9 +773,4 @@ class AsyncRelayerClient(AsyncApiClient):
         body_json = json.dumps(body, separators=(',', ':'))
         headers = self._build_headers("POST", endpoint, body_json)
 
-        return await self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return await self._request("POST", endpoint, data=body, headers=headers)

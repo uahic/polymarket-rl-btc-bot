@@ -6,8 +6,8 @@ from enum import Enum
 from functools import cached_property
 
 class OrderSide(Enum):
-    BUY = "BUY" 
-    SELL = "SELL" 
+    BUY = 0
+    SELL = 1 
 
 # USDC has 6 decimal places
 USDC_DECIMALS = 6

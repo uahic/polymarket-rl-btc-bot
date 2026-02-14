@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Setup Script - Initial Configuration
 
@@ -11,18 +12,21 @@ Guides the user through setting up the trading bot:
 This script should be run once to initialize the trading bot.
 """
 
+import os
 import sys
+import json
 from pathlib import Path
-from getpass import getpass
-from eth_account import Account
 
 # Add parent directory to path
-ROOT_PATH = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT_PATH))
+sys.path.insert(0, str(Path(__file__).parent))
 
+from getpass import getpass
+from eth_account import Account
+import yaml
 
-from key_store import EncryptedKeyStore, verify_private_key
-from config import BuilderConfig, Config
+from security.key_store import EncryptedKeyStore, verify_private_key
+from config import Config, BuilderConfig
+
 
 
 # ANSI color codes
@@ -61,9 +65,7 @@ def print_step(step: int, total: int, title: str) -> None:
 def input_private_key() -> str:
     """Get and validate private key from user."""
     print("Enter your MetaMask private key (will be encrypted and stored securely)")
-    print(
-        f"{Colors.YELLOW}Tip: Open MetaMask → Account Details → Export Private Key{Colors.RESET}\n"
-    )
+    print(f"{Colors.YELLOW}Tip: Open MetaMask → Account Details → Export Private Key{Colors.RESET}\n")
 
     while True:
         private_key = getpass(f"{Colors.BOLD}Private Key{Colors.RESET}: ").strip()
@@ -85,9 +87,7 @@ def input_private_key() -> str:
 def input_password() -> str:
     """Get and confirm encryption password."""
     print("Set a password to encrypt your private key")
-    print(
-        f"{Colors.YELLOW}This password is required to start the trading bot{Colors.RESET}\n"
-    )
+    print(f"{Colors.YELLOW}This password is required to start the trading bot{Colors.RESET}\n")
 
     while True:
         password = getpass(f"{Colors.BOLD}Password{Colors.RESET}: ").strip()
@@ -108,9 +108,7 @@ def input_password() -> str:
 def input_safe_address() -> str:
     """Get Safe address from user."""
     print("Enter your Polymarket Safe/Proxy wallet address")
-    print(
-        f"{Colors.YELLOW}Tip: polymarket.com/settings → General → Wallet Address{Colors.RESET}\n"
-    )
+    print(f"{Colors.YELLOW}Tip: polymarket.com/settings → General → Wallet Address{Colors.RESET}\n")
 
     while True:
         address = input(f"{Colors.BOLD}Safe Address{Colors.RESET}: ").strip().lower()
@@ -129,16 +127,10 @@ def input_safe_address() -> str:
 def input_builder_credentials() -> dict:
     """Get Builder Program credentials (optional)."""
     print(f"{Colors.BLUE}Builder Program Credentials (optional){Colors.RESET}")
-    print(
-        "If you have Builder Program access, enter your credentials for gasless trading"
-    )
-    print(
-        f"{Colors.YELLOW}Leave empty to skip (you'll pay gas fees yourself){Colors.RESET}\n"
-    )
+    print("If you have Builder Program access, enter your credentials for gasless trading")
+    print(f"{Colors.YELLOW}Leave empty to skip (you'll pay gas fees yourself){Colors.RESET}\n")
 
-    api_key = input(
-        f"{Colors.BOLD}Builder API Key{Colors.RESET} (Enter to skip): "
-    ).strip()
+    api_key = input(f"{Colors.BOLD}Builder API Key{Colors.RESET} (Enter to skip): ").strip()
     if not api_key:
         return {}
 
@@ -151,12 +143,14 @@ def input_builder_credentials() -> dict:
     return {
         "api_key": api_key,
         "api_secret": api_secret,
-        "api_passphrase": api_passphrase,
+        "api_passphrase": api_passphrase
     }
 
 
 def create_config(
-    safe_address: str, builder_creds: dict, data_dir: str = "credentials"
+    safe_address: str,
+    builder_creds: dict,
+    data_dir: str = "credentials"
 ) -> Config:
     """Create Config object."""
     config = Config(
@@ -178,12 +172,8 @@ def create_config(
 def main():
     """Main setup function."""
     print_header("Polymarket Trading Bot Setup")
-    print(
-        f"{Colors.BLUE}This script will help you configure the trading bot.{Colors.RESET}"
-    )
-    print(
-        f"{Colors.BLUE}Your private key will be encrypted and stored securely.{Colors.RESET}"
-    )
+    print(f"{Colors.BLUE}This script will help you configure the trading bot.{Colors.RESET}")
+    print(f"{Colors.BLUE}Your private key will be encrypted and stored securely.{Colors.RESET}")
 
     # Step 1: Private Key
     print_step(1, 4, "Private Key")
@@ -207,17 +197,13 @@ def main():
 
     # Create directories
     print("\nCreating directories...")
-    Path(ROOT_PATH, "credentials").mkdir(exist_ok=True)
+    Path("credentials").mkdir(exist_ok=True)
     print_success("Created credentials/ directory")
 
     # Encrypt and save private key
     print("\nEncrypting private key...")
     manager = EncryptedKeyStore()
-    key_path = manager.encrypt_and_save(
-        private_key,
-        password,
-        str(Path(ROOT_PATH, "credentials", "encrypted_key.json").absolute()),
-    )
+    key_path = manager.encrypt_and_save(private_key, password, "credentials/encrypted_key.json")
     print_success(f"Encrypted key saved to {key_path}")
 
     # Create config.yaml
@@ -241,9 +227,7 @@ def main():
         print(f"{Colors.GREEN}Gasless mode: ENABLED{Colors.RESET}")
     else:
         print_warning("Gasless mode: DISABLED (no Builder credentials)")
-        print(
-            f"{Colors.YELLOW}To enable later, add Builder credentials to config.yaml{Colors.RESET}"
-        )
+        print(f"{Colors.YELLOW}To enable later, add Builder credentials to config.yaml{Colors.RESET}")
 
 
 if __name__ == "__main__":

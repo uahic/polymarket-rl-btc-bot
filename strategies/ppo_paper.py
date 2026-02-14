@@ -12,8 +12,8 @@ from .ml_base_strategy import MLStrategy
 class Experience:
     """Single experience tuple with temporal context."""
 
-    state: np.ndarray  # Current state features (18,)
-    temporal_state: np.ndarray  # Stacked temporal features (history_len * 18,)
+    state: np.ndarray  # Current state features (21,)
+    temporal_state: np.ndarray  # Stacked temporal features (history_len * 21,)
     action: int
     reward: float
     next_state: np.ndarray
@@ -29,11 +29,11 @@ class TemporalEncoder(nn.Module):
     Takes last N states and compresses them into a fixed-size representation
     that captures velocity, acceleration, and trend direction.
 
-    Architecture: (history_len * 18) → 64 → LayerNorm → tanh → 32
+    Architecture: (history_len * 21) → 64 → LayerNorm → tanh → 32
     Output is concatenated with current state features.
     """
 
-    def __init__(self, input_dim: int = 18, history_len: int = 5, output_dim: int = 32):
+    def __init__(self, input_dim: int = 21, history_len: int = 5, output_dim: int = 32):
         super().__init__()
         self.history_len = history_len
         self.temporal_input = input_dim * history_len
@@ -53,7 +53,7 @@ class Actor(nn.Module):
     """Policy network with temporal awareness.
 
     Architecture:
-        Current state (18) + Temporal features (32) = 50
+        Current state (21) + Temporal features (32) = 50
         → 64 → LayerNorm → tanh → 64 → LayerNorm → tanh → 3 (softmax)
 
     Temporal encoder captures momentum/trends from state history.
@@ -62,7 +62,7 @@ class Actor(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 18,
+        input_dim: int = 21,
         hidden_size: int = 64,
         output_dim: int = 3,
         history_len: int = 5,
@@ -85,8 +85,8 @@ class Actor(nn.Module):
         """Forward pass. Returns action probabilities.
 
         Args:
-            current_state: (batch, 18) current features
-            temporal_state: (batch, history_len * 18) stacked history
+            current_state: (batch, 21) current features
+            temporal_state: (batch, history_len * 21) stacked history
         """
         # Encode temporal context
         temporal_features = self.temporal_encoder(temporal_state)
@@ -105,7 +105,7 @@ class Critic(nn.Module):
     """Value network with temporal awareness - ASYMMETRIC (larger than actor).
 
     Architecture:
-        Current state (18) + Temporal features (32) = 50
+        Current state (21) + Temporal features (32) = 50
         → 96 → LayerNorm → tanh → 96 → LayerNorm → tanh → 1
 
     Larger network (96 vs 64) because:
@@ -116,7 +116,7 @@ class Critic(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 18,
+        input_dim: int = 21,
         hidden_size: int = 96,
         history_len: int = 5,
         temporal_dim: int = 32,
@@ -138,8 +138,8 @@ class Critic(nn.Module):
         """Forward pass. Returns value estimate.
 
         Args:
-            current_state: (batch, 18) current features
-            temporal_state: (batch, history_len * 18) stacked history
+            current_state: (batch, 21) current features
+            temporal_state: (batch, history_len * 21) stacked history
         """
         # Encode temporal context
         temporal_features = self.temporal_encoder(temporal_state)
@@ -165,7 +165,7 @@ class PPOStrategy(MLStrategy):
 
     def __init__(
         self,
-        input_dim: int = 18,
+        input_dim: int = 21,
         hidden_size: int = 64,  # Actor hidden size
         critic_hidden_size: int = 96,  # Larger critic for better value estimation
         history_len: int = 5,  # Number of past states for temporal processing
