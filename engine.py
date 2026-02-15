@@ -219,6 +219,19 @@ class TradingEngine:
             # Keep existing paper trading logic
             self._execute_action_paper(cid, action, state)
 
+    def _close_position_paper(self, cid: str, pos: Position, price: float, side: str):
+        """Close a position in paper trading mode."""
+        exit_price = price if side == "UP" else (1 - price)
+        pnl = self._calculate_pnl(pos, exit_price, side)
+        self._record_trade(pos, price, pnl, f"CLOSE {side}", cid=cid)
+        self.pending_rewards[cid] = pnl
+
+        # Return capital to simulator
+        if self.order_executor:
+            self.order_executor.realize_pnl(pos.size + pnl)
+
+        self._clear_position(pos)
+
     def _execute_action_paper(self, cid: str, action: Action, state: MarketState):
         """Execute simulated trade with realistic fills, slippage, and balance tracking."""
         pos = self.positions.get(cid)
@@ -231,32 +244,10 @@ class TradingEngine:
         # Close existing position if switching sides
         if pos.size > 0:
             if action.is_sell and pos.side == "UP":
-                shares = pos.size / pos.entry_price
-                pnl = (price - pos.entry_price) * shares
-                self._record_trade(pos, price, pnl, "CLOSE UP", cid=cid)
-                self.pending_rewards[cid] = pnl  # Pure realized PnL reward
-
-                # Return capital to simulator
-                if self.order_executor:
-                    self.order_executor.realize_pnl(pos.size + pnl)
-
-                pos.size = 0
-                pos.side = None
+                self._close_position_paper(cid, pos, price, "UP")
                 return
-
             elif action.is_buy and pos.side == "DOWN":
-                exit_down_price = 1 - price
-                shares = pos.size / pos.entry_price
-                pnl = (exit_down_price - pos.entry_price) * shares
-                self._record_trade(pos, price, pnl, "CLOSE DOWN", cid=cid)
-                self.pending_rewards[cid] = pnl
-
-                # Return capital to simulator
-                if self.order_executor:
-                    self.order_executor.realize_pnl(pos.size + pnl)
-
-                pos.size = 0
-                pos.side = None
+                self._close_position_paper(cid, pos, price, "DOWN")
                 return
 
         # Open new position with simulated fill
@@ -264,6 +255,18 @@ class TradingEngine:
             size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(action.size_multiplier, "")
 
             side = "BUY" if action.is_buy else "SELL"
+
+            # Determine limit price for FOK orders
+            limit_price = None
+            if self.order_type == "FOK":
+                # Set aggressive limit price for market-taking FOK orders
+                if side == "BUY":
+                    # Willing to pay up to ask + small buffer
+                    limit_price = (state.best_ask if state.best_ask > 0 else price) * 1.002  # +20 bps
+                else:  # SELL
+                    # Willing to accept down to (1 - bid) + small buffer
+                    limit_price = (1 - state.best_bid if state.best_bid > 0 else 1 - price) * 1.002
+
             fill_result = self.order_executor.simulate_order_fill(
                 side=side,
                 asset=pos.asset,
@@ -273,11 +276,14 @@ class TradingEngine:
                 current_ask=state.best_ask,
                 spread=state.spread,
                 order_book_imbalance=state.order_book_imbalance_l1,
+                order_type=self.order_type,
+                limit_price=limit_price,
             )
 
             if not fill_result["filled"]:
                 # Order rejected
-                print(f"    ✗ REJECTED: {fill_result['reason']} (bal: ${fill_result['balance_remaining']:.2f})")
+                order_type_label = f"[{fill_result['order_type']}]" if fill_result.get('order_type') else ""
+                print(f"    ✗ REJECTED {order_type_label}: {fill_result['reason']} (bal: ${fill_result['balance_remaining']:.2f})")
                 state.last_action_status = "failed"
                 state.consecutive_failures += 1
                 return
@@ -285,6 +291,7 @@ class TradingEngine:
             # Order filled
             fill_price = fill_result["fill_price"]
             slippage_bps = fill_result["slippage"] * 10000
+            order_type_label = f"[{fill_result['order_type']}]" if fill_result.get('order_type') else ""
 
             if action.is_buy:
                 pos.side = "UP"
@@ -295,7 +302,7 @@ class TradingEngine:
                 pos.time_remaining_at_entry = state.time_remaining
                 print(
                     f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {fill_price:.3f} "
-                    f"(slip: {slippage_bps:+.1f}bps, bal: ${fill_result['balance_remaining']:.2f})"
+                    f"{order_type_label} (slip: {slippage_bps:+.1f}bps, bal: ${fill_result['balance_remaining']:.2f})"
                 )
                 emit_trade(f"BUY_{size_label}", pos.asset, pos.size)
 
@@ -308,12 +315,30 @@ class TradingEngine:
                 pos.time_remaining_at_entry = state.time_remaining
                 print(
                     f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {fill_price:.3f} "
-                    f"(slip: {slippage_bps:+.1f}bps, bal: ${fill_result['balance_remaining']:.2f})"
+                    f"{order_type_label} (slip: {slippage_bps:+.1f}bps, bal: ${fill_result['balance_remaining']:.2f})"
                 )
                 emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
 
             state.last_action_status = "success"
             state.consecutive_failures = 0
+
+    def _is_balance_error(self, error_msg: str) -> bool:
+        """Check if error is related to insufficient balance or allowance."""
+        return "not enough balance" in error_msg.lower() or "allowance" in error_msg.lower()
+
+    def _handle_live_trading_error(self, cid: str, error_msg: str, asset: str, is_order_error: bool = False):
+        """Handle errors from live trading operations."""
+        error_type = "ORDER ERROR" if is_order_error else "ERROR"
+        print(f"  [{error_type}] {asset}: {error_msg}")
+
+        if self._is_balance_error(error_msg):
+            print(f"  [BALANCE] Insufficient funds - skipping trades for now")
+            self._remove_pending_order(cid)
+        else:
+            import traceback
+            traceback.print_exc()
+
+        self._handle_order_failure(cid, error_msg)
 
     async def _execute_action_live(self, cid: str, action: Action, state: MarketState):
         """Execute live order via CLOB API."""
@@ -352,35 +377,9 @@ class TradingEngine:
                 )
 
         except OrderError as e:
-            error_msg = str(e)
-            print(f"  [ORDER ERROR] {m.asset}: {error_msg}")
-            # Check for balance/allowance error
-            if "not enough balance" in error_msg.lower() or "allowance" in error_msg.lower():
-                print(f"  [BALANCE] Insufficient funds - skipping trades for now")
-                # Clear pending order if it was tracked
-                if cid in self.pending_orders:
-                    del self.pending_orders[cid]
-                if cid in self.order_timestamps:
-                    del self.order_timestamps[cid]
-            else:
-                import traceback
-                traceback.print_exc()
-            self._handle_order_failure(cid, error_msg)
+            self._handle_live_trading_error(cid, str(e), m.asset, is_order_error=True)
         except Exception as e:
-            error_msg = str(e)
-            print(f"  [ERROR] {m.asset}: {error_msg}")
-            # Check for balance/allowance error in exception
-            if "not enough balance" in error_msg.lower() or "allowance" in error_msg.lower():
-                print(f"  [BALANCE] Insufficient funds - skipping trades for now")
-                # Clear pending order if it was tracked
-                if cid in self.pending_orders:
-                    del self.pending_orders[cid]
-                if cid in self.order_timestamps:
-                    del self.order_timestamps[cid]
-            else:
-                import traceback
-                traceback.print_exc()
-            self._handle_order_failure(cid, error_msg)
+            self._handle_live_trading_error(cid, str(e), m.asset, is_order_error=False)
 
     async def _open_position_live(
         self,
@@ -415,30 +414,23 @@ class TradingEngine:
         size = trade_amount / price
 
         # Create order using py_clob_client
+        # Note: fee_rate_bps will be fetched and set by transaction_client.create_order()
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=size,
             side=side,
-            fee_rate_bps=0,
+            fee_rate_bps=0,  # Placeholder - will be resolved by create_order()
             nonce=0,
         )
 
-        # Use transaction_client's order_builder to create signed order
-
-        # signed_order = self.transaction_client.order_builder.create_order(
-        #     order_args, order_options
-        # )
+        # create_order() will fetch fee_rate_bps from API via __resolve_fee_rate()
         signed_order = await self.transaction_client.create_order(
             order_args, self.order_options
         )
         response = await self.transaction_client.post_order(
             signed_order, self.order_type
         )
-
-        # response = await self.transaction_client.post_order(
-        #     signed_order=signed_order, order_type=self.order_type
-        # )
 
         # Track order if GTC
         if self.order_type == "GTC":
@@ -489,29 +481,19 @@ class TradingEngine:
         # Calculate shares
         shares = pos.size / pos.entry_price
 
-        # Create SELL order using py_clob_client (use FOK for exits)
+        # Create SELL order using py_clob_client
+        # Note: fee_rate_bps will be fetched and set by create_and_post_order()
         order_args = OrderArgs(
             token_id=token_id,
             price=exit_price,
             size=shares,
             side=ORDER_SELL,
-            fee_rate_bps=0,
+            fee_rate_bps=0,  # Placeholder - will be resolved by create_order()
             nonce=0,
         )
 
-        # Create order options
-
-        # signed_order = await self.transaction_client.create_order(
-        #     order_args, self.order_options
-        # )
-        # response = await self.transaction_client.post_order(
-        #     signed_order, orderType="GTC"
-        # )
+        # create_and_post_order() internally calls create_order() which fetches fee_rate_bps
         response = await self.transaction_client.create_and_post_order(order_args, self.order_options)
-        # signed_order = self.transaction_client.order_builder.create_order(
-        #     order_args, order_options
-        # )
-        # await self.transaction_client.post_order(signed_order, order_type="GTC")
 
         # Check if order was posted successfully
         order_id = response.get("orderID")
@@ -545,62 +527,55 @@ class TradingEngine:
             return
 
         try:
-            # await self.transaction_client.cancel_order(order_id)
             response = await self.transaction_client.cancel(order_id)
+            order_id_short = order_id[:8]
 
-            # Check if cancellation was successful
-            # Response should contain success status or order status
+            # Handle response and determine status message
+            status_msg = None
             if response:
-                # Handle dict response with status field
                 if isinstance(response, dict):
                     status = response.get("status", "").lower()
                     if status in ["cancelled", "canceled"]:
-                        print(
-                            f"    [CANCEL] Order {order_id[:8]}... cancelled successfully"
-                        )
-                        del self.pending_orders[cid]
-                        if cid in self.order_timestamps:
-                            del self.order_timestamps[cid]
+                        status_msg = "cancelled successfully"
                     elif status == "matched":
-                        # Order was already filled before we could cancel
-                        print(f"    [CANCEL] Order {order_id[:8]}... already filled")
-                        # Let the status check handler deal with this
-                        del self.pending_orders[cid]
-                        if cid in self.order_timestamps:
-                            del self.order_timestamps[cid]
+                        status_msg = "already filled"
                     elif status == "":
-                        # Empty status - assume cancelled
-                        print(f"    [CANCEL] Order {order_id[:8]}... cancelled (empty status)")
-                        del self.pending_orders[cid]
-                        if cid in self.order_timestamps:
-                            del self.order_timestamps[cid]
+                        status_msg = "cancelled (empty status)"
                     else:
-                        print(
-                            f"    [CANCEL] Order {order_id[:8]}... unexpected status: {status}"
-                        )
-                        # Still remove from pending to avoid loops
-                        del self.pending_orders[cid]
-                        if cid in self.order_timestamps:
-                            del self.order_timestamps[cid]
+                        status_msg = f"unexpected status: {status}"
                 else:
-                    # Non-dict response (e.g., string or boolean)
-                    print(f"    [CANCEL] Order {order_id[:8]}... cancelled (non-dict response)")
-                    del self.pending_orders[cid]
-                    if cid in self.order_timestamps:
-                        del self.order_timestamps[cid]
+                    status_msg = "cancelled (non-dict response)"
             else:
-                # Assume success if no response returned
-                print(f"    [CANCEL] Order {order_id[:8]}... cancelled (no response)")
-                del self.pending_orders[cid]
-                if cid in self.order_timestamps:
-                    del self.order_timestamps[cid]
+                status_msg = "cancelled (no response)"
+
+            if status_msg:
+                print(f"    [CANCEL] Order {order_id_short}... {status_msg}")
+
+            # Always remove from pending to avoid loops
+            self._remove_pending_order(cid)
+
         except Exception as e:
             print(f"    [CANCEL ERROR] {order_id[:8]}...: {e}")
             # Remove from pending even on error to prevent infinite loops
-            if cid in self.pending_orders:
-                del self.pending_orders[cid]
-            if cid in self.order_timestamps:
-                del self.order_timestamps[cid]
+            self._remove_pending_order(cid)
+
+    def _finalize_close_order(self, cid: str, pending: dict):
+        """Finalize a filled close order."""
+        pos = self.positions.get(cid)
+        state = self.states.get(cid)
+
+        if pos and state and pos.size > 0:
+            side = pending["side"]
+            exit_price = pending["price"]
+            shares = pending["shares"]
+            pnl = (exit_price - pos.entry_price) * shares
+
+            self._record_trade(pos, exit_price, pnl, f"CLOSE {side}", cid=cid)
+            self.pending_rewards[cid] = pnl
+            self._clear_position(pos)
+            state.last_action_status = "success"
+
+            print(f"    [FILLED] CLOSE {side} order filled @ {exit_price:.3f}")
 
     async def _check_close_order_status(self, cid: str):
         """Check if a pending close order has been filled."""
@@ -622,50 +597,20 @@ class TradingEngine:
             # Handle case where API returns a string (transaction hash) instead of dict
             if isinstance(order_status, str):
                 print(f"    [STATUS CHECK] Order {order_id[:8]}... returned tx hash, assuming filled")
-                # Remove from pending and let next iteration handle position state
-                del self.pending_orders[cid]
-                if cid in self.order_timestamps:
-                    del self.order_timestamps[cid]
+                self._remove_pending_order(cid)
                 return
 
             status = order_status.get("status", "").lower()
 
             # Check if order is filled
             if status == "matched":
-                # Order filled - finalize the close
-                pos = self.positions.get(cid)
-                state = self.states.get(cid)
-
-                if pos and state and pos.size > 0:  # Only close if position still exists
-                    side = pending["side"]
-                    exit_price = pending["price"]
-                    shares = pending["shares"]
-
-                    # Calculate PnL
-                    pnl = (exit_price - pos.entry_price) * shares
-
-                    # Record and clear position
-                    self._record_trade(pos, exit_price, pnl, f"CLOSE {side}", cid=cid)
-                    self.pending_rewards[cid] = pnl
-                    pos.size = 0
-                    pos.side = None
-
-                    # Update state
-                    state.last_action_status = "success"
-
-                    print(f"    [FILLED] CLOSE {side} order filled @ {exit_price:.3f}")
-
-                # Remove from pending
-                del self.pending_orders[cid]
-                if cid in self.order_timestamps:
-                    del self.order_timestamps[cid]
+                self._finalize_close_order(cid, pending)
+                self._remove_pending_order(cid)
 
             elif status in ["cancelled", "expired"]:
                 # Order cancelled/expired - keep position open, remove pending
                 print(f"    [CANCELLED] CLOSE order {status}")
-                del self.pending_orders[cid]
-                if cid in self.order_timestamps:
-                    del self.order_timestamps[cid]
+                self._remove_pending_order(cid)
                 state = self.states.get(cid)
                 if state:
                     state.last_action_status = "failed"
@@ -688,6 +633,49 @@ class TradingEngine:
         for cid in expired_cids:
             if cid in self.pending_orders:
                 await self._cancel_pending_order(cid)
+
+    def _calculate_fee_per_share(self, probability: float, fee_rate_bps: int) -> float:
+        """Calculate Polymarket fee per share using probability-dependent formula.
+
+        Formula: fee(p) = p × (1 − p) × r
+        Where:
+            p = probability/price (0.01 to 0.99)
+            r = fee_rate_bps / 10000 (convert basis points to decimal)
+
+        Fee peaks at p=0.50 (~1.56% effective for typical fee_rate_bps)
+        Fee drops toward 0% at extremes (p→0.01 or p→0.99)
+
+        Args:
+            probability: Current probability/price (0.01 to 0.99)
+            fee_rate_bps: Fee rate in basis points from API
+
+        Returns:
+            Fee per share in USDC
+        """
+        # Clamp probability to valid range
+        p = max(0.01, min(0.99, probability))
+        r = fee_rate_bps / 10000.0
+        return p * (1 - p) * r
+
+    def _calculate_pnl(self, pos: Position, exit_price: float, side: str) -> float:
+        """Calculate PnL for a position."""
+        shares = pos.size / pos.entry_price
+        if side == "UP":
+            return (exit_price - pos.entry_price) * shares
+        else:  # DOWN
+            return (exit_price - pos.entry_price) * shares
+
+    def _clear_position(self, pos: Position):
+        """Clear a position state."""
+        pos.size = 0
+        pos.side = None
+
+    def _remove_pending_order(self, cid: str):
+        """Remove pending order tracking for a market."""
+        if cid in self.pending_orders:
+            del self.pending_orders[cid]
+        if cid in self.order_timestamps:
+            del self.order_timestamps[cid]
 
     def _record_trade(
         self, pos: Position, price: float, pnl: float, action: str, cid: str = None
@@ -731,10 +719,40 @@ class TradingEngine:
     def _compute_step_reward(
         self, cid: str, state: MarketState, action: Action, pos: Position
     ) -> float:
-        """Compute reward signal for RL training - pure realized PnL."""
-        # Only reward on position close - cleaner signal
-        # Reward is set when trade closes in _execute_trade via self.pending_rewards
-        return self.pending_rewards.pop(cid, 0.0)
+        """Compute reward signal for RL training with shaped intermediate rewards.
+
+        This fixes the credit assignment problem by providing immediate feedback:
+        - Terminal reward (large): realized PnL when position closes
+        - Shaping reward (small): unrealized PnL change for open positions
+
+        The shaping coefficient (0.01) ensures terminal rewards dominate while
+        still providing learning signal every tick to connect actions to outcomes.
+        """
+        # Terminal reward on position close (primary learning signal)
+        if cid in self.pending_rewards:
+            terminal_reward = self.pending_rewards.pop(cid)
+            return terminal_reward
+
+        # Shaped reward for open positions (secondary learning signal)
+        # This helps with credit assignment by showing PnL direction immediately
+        if pos and pos.size > 0:
+            # Small coefficient (0.01) to avoid overwhelming terminal rewards
+            # but still provide gradient signal every tick
+            shaping_reward = state.position_pnl * 0.01
+            return shaping_reward
+
+        # No position, no reward
+        return 0.0
+
+    def _force_close_position(self, cid: str, pos: Position, state: MarketState):
+        """Force close a position at current market prices."""
+        price = state.prob
+        exit_price = price if pos.side == "UP" else (1 - price)
+        pnl = self._calculate_pnl(pos, exit_price, pos.side)
+
+        self._record_trade(pos, price, pnl, f"FORCE CLOSE {pos.side}", cid=cid)
+        self.pending_rewards[cid] = pnl
+        self._clear_position(pos)
 
     def close_all_positions(self):
         """Close all positions at current prices."""
@@ -742,20 +760,7 @@ class TradingEngine:
             if pos.size > 0:
                 state = self.states.get(cid)
                 if state:
-                    price = state.prob
-                    shares = pos.size / pos.entry_price
-                    if pos.side == "UP":
-                        pnl = (price - pos.entry_price) * shares
-                    else:
-                        exit_down_price = 1 - price
-                        pnl = (exit_down_price - pos.entry_price) * shares
-
-                    self._record_trade(
-                        pos, price, pnl, f"FORCE CLOSE {pos.side}", cid=cid
-                    )
-                    self.pending_rewards[cid] = pnl  # Pure realized PnL reward
-                    pos.size = 0
-                    pos.side = None
+                    self._force_close_position(cid, pos, state)
 
     async def close_all_positions_async(self):
         """Close all positions asynchronously for live trading."""
@@ -769,91 +774,107 @@ class TradingEngine:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def update_state(self, cid: str, m: Market, state: MarketState, time_now: datetime):
-
-        # Update state from orderbook - CRITICAL for 15-min
+    def _update_orderbook_state(self, cid: str, state: MarketState):
+        """Update market state from orderbook data."""
         ob = self.orderbook_streamer.get_orderbook(cid, "UP")
-        if ob and ob.mid_price:
-            state.prob = ob.mid_price
-            state.prob_history.append(ob.mid_price)
-            if len(state.prob_history) > 100:
-                state.prob_history = state.prob_history[-100:]
-            state.best_bid = ob.best_bid or 0.0
-            state.best_ask = ob.best_ask or 0.0
-            state.spread = ob.spread or 0.0
+        if not ob or not ob.mid_price:
+            return
 
-            # Orderbook imbalance - L1 (top of book)
-            if ob.bids and ob.asks:
-                bid_vol_l1 = ob.bids[0][1] if ob.bids else 0
-                ask_vol_l1 = ob.asks[0][1] if ob.asks else 0
-                total_l1 = bid_vol_l1 + ask_vol_l1
-                state.order_book_imbalance_l1 = (
-                    (bid_vol_l1 - ask_vol_l1) / total_l1 if total_l1 > 0 else 0.0
-                )
+        state.prob = ob.mid_price
+        state.prob_history.append(ob.mid_price)
+        if len(state.prob_history) > 100:
+            state.prob_history = state.prob_history[-100:]
 
-                # Orderbook imbalance - L5 (depth)
-                bid_vol_l5 = sum(size for _, size in ob.bids[:5])
-                ask_vol_l5 = sum(size for _, size in ob.asks[:5])
-                total_l5 = bid_vol_l5 + ask_vol_l5
-                state.order_book_imbalance_l5 = (
-                    (bid_vol_l5 - ask_vol_l5) / total_l5 if total_l5 > 0 else 0.0
-                )
+        state.best_bid = ob.best_bid or 0.0
+        state.best_ask = ob.best_ask or 0.0
+        state.spread = ob.spread or 0.0
 
-        # Update binance price
-        binance_price = self.price_streamer.get_price(m.asset)
+        # Orderbook imbalance - L1 (top of book)
+        if ob.bids and ob.asks:
+            bid_vol_l1 = ob.bids[0][1] if ob.bids else 0
+            ask_vol_l1 = ob.asks[0][1] if ob.asks else 0
+            total_l1 = bid_vol_l1 + ask_vol_l1
+            state.order_book_imbalance_l1 = (
+                (bid_vol_l1 - ask_vol_l1) / total_l1 if total_l1 > 0 else 0.0
+            )
+
+            # Orderbook imbalance - L5 (depth)
+            bid_vol_l5 = sum(size for _, size in ob.bids[:5])
+            ask_vol_l5 = sum(size for _, size in ob.asks[:5])
+            total_l5 = bid_vol_l5 + ask_vol_l5
+            state.order_book_imbalance_l5 = (
+                (bid_vol_l5 - ask_vol_l5) / total_l5 if total_l5 > 0 else 0.0
+            )
+
+    def _update_binance_price(self, cid: str, asset: str, state: MarketState):
+        """Update Binance price and change from market open."""
+        binance_price = self.price_streamer.get_price(asset)
         state.binance_price = binance_price
         open_price = self.open_prices.get(cid, binance_price)
         if open_price > 0:
             state.binance_change = (binance_price - open_price) / open_price
 
+    def _update_futures_state(self, asset: str, state: MarketState):
+        """Update state with futures market data."""
+        futures = self.futures_streamer.get_state(asset)
+        if not futures:
+            return
+
+        # Order flow - THE EDGE
+        old_cvd = state.cvd
+        state.cvd = futures.cvd
+        state.cvd_acceleration = (
+            (futures.cvd - old_cvd) / 1e6 if old_cvd != 0 else 0.0
+        )
+        state.trade_flow_imbalance = futures.trade_flow_imbalance
+
+        # Ultra-short momentum
+        state.returns_1m = futures.returns_1m
+        state.returns_5m = futures.returns_5m
+        state.returns_10m = futures.returns_10m
+
+        # Microstructure - CRITICAL for 15-min
+        state.trade_intensity = futures.trade_intensity
+        state.large_trade_flag = futures.large_trade_flag
+
+        # Volatility
+        state.realized_vol_5m = (
+            futures.realized_vol_1h / 3.5 if futures.realized_vol_1h > 0 else 0.0
+        )
+        state.vol_expansion = futures.vol_ratio - 1.0
+
+        # Regime context (slow but useful for context)
+        state.vol_regime = 1.0 if futures.realized_vol_1h > 0.01 else 0.0
+        state.trend_regime = 1.0 if abs(futures.returns_1h) > 0.005 else 0.0
+
+    def _update_position_state(self, cid: str, state: MarketState):
+        """Update position-related fields in market state."""
+        pos = self.positions.get(cid)
+        if pos and pos.size > 0:
+            state.has_position = True
+            state.position_side = pos.side
+            exit_price = state.prob if pos.side == "UP" else (1 - state.prob)
+            state.position_pnl = self._calculate_pnl(pos, exit_price, pos.side)
+        else:
+            state.has_position = False
+            state.position_side = None
+            state.position_pnl = 0.0
+
+    def update_state(self, cid: str, m: Market, state: MarketState, time_now: datetime):
+        # Update state from orderbook - CRITICAL for 15-min
+        self._update_orderbook_state(cid, state)
+
+        # Update binance price
+        self._update_binance_price(cid, m.asset, state)
+
         # Update futures data (focused on fast-updating features)
-        futures = self.futures_streamer.get_state(m.asset)
-        if futures:
-            # Order flow - THE EDGE
-            old_cvd = state.cvd
-            state.cvd = futures.cvd
-            state.cvd_acceleration = (
-                (futures.cvd - old_cvd) / 1e6 if old_cvd != 0 else 0.0
-            )
-            state.trade_flow_imbalance = futures.trade_flow_imbalance
-
-            # Ultra-short momentum
-            state.returns_1m = futures.returns_1m
-            state.returns_5m = futures.returns_5m
-            state.returns_10m = futures.returns_10m  # Properly computed from klines
-
-            # Microstructure - CRITICAL for 15-min
-            state.trade_intensity = futures.trade_intensity
-            state.large_trade_flag = futures.large_trade_flag
-
-            # Volatility
-            state.realized_vol_5m = (
-                futures.realized_vol_1h / 3.5 if futures.realized_vol_1h > 0 else 0.0
-            )
-            state.vol_expansion = futures.vol_ratio - 1.0
-
-            # Regime context (slow but useful for context)
-            state.vol_regime = 1.0 if futures.realized_vol_1h > 0.01 else 0.0
-            state.trend_regime = 1.0 if abs(futures.returns_1h) > 0.005 else 0.0
+        self._update_futures_state(m.asset, state)
 
         # Time remaining - CRITICAL
         state.time_remaining = (m.end_time - time_now).total_seconds() / 900
 
         # Update position info in state
-        pos = self.positions.get(cid)
-        if pos and pos.size > 0:
-            state.has_position = True
-            state.position_side = pos.side
-            shares = pos.size / pos.entry_price
-            if pos.side == "UP":
-                state.position_pnl = (state.prob - pos.entry_price) * shares
-            else:
-                current_down_price = 1 - state.prob
-                state.position_pnl = (current_down_price - pos.entry_price) * shares
-        else:
-            state.has_position = False
-            state.position_side = None
-            state.position_pnl = 0.0
+        self._update_position_state(cid, state)
 
         # Update order status tracking
         if cid in self.pending_orders and cid in self.order_timestamps:
@@ -865,12 +886,12 @@ class TradingEngine:
 
             # Check order status periodically for close orders
             if self.live_trading and self.pending_orders[cid].get("is_close"):
-                # Check every 2 seconds for close orders
-                if age_seconds > 0 and int(age_seconds) % 2 == 0:
+                # Check every 1 second for close orders
+                if age_seconds > 0 and int(age_seconds) % 1 == 0:
                     asyncio.create_task(self._check_close_order_status(cid))
 
-            # Auto-cancel stale orders (>5 min) for high-frequency trading
-            if age_seconds > 300 and self.live_trading:
+            # Auto-cancel stale orders (>5 seconds) for high-frequency trading
+            if age_seconds > 5 and self.live_trading:
                 # Schedule as fire-and-forget task (update_state is NOT async)
                 asyncio.create_task(self._cancel_pending_order(cid))
         elif state.last_action_status == "pending":
@@ -881,9 +902,7 @@ class TradingEngine:
         # Update available balance from simulator
         if self.order_executor:
             state.available_balance = self.order_executor.get_balance()
-
-        # consecutive_failures updated in _handle_order_failure
-
+  
     async def decision_loop(self):
         """Main trading loop."""
         tick = 0
@@ -900,6 +919,7 @@ class TradingEngine:
             if self.live_trading and expired:
                 await self._cancel_expired_orders(expired)
 
+            # Handle closed/expired markets
             for cid in expired:
                 print(f"\n  EXPIRED: {self.markets[cid].asset}")
 

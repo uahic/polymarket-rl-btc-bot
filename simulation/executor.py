@@ -25,25 +25,55 @@ class SimulatedOrderExecutor:
     - Balance tracking with initial capital
     - Realistic fill probability based on spread and liquidity
     - Slippage simulation based on order book imbalance
+    - Probability-dependent Polymarket fee calculation
     - Fill rejection (insufficient balance, no liquidity)
     - Trade history tracking
     """
 
-    def __init__(self, initial_balance: float = 1000.0):
+    def __init__(self, initial_balance: float = 1000.0, default_fee_rate_bps: int = 625):
         """Initialize simulator with starting capital.
 
         Args:
             initial_balance: Starting USDC balance
+            default_fee_rate_bps: Default fee_rate_bps for 15-min markets (625 typical)
+                                  Produces ~1.56% effective fee at p=0.50
         """
         self.balance = initial_balance
         self.initial_balance = initial_balance
         self.fills_history: List[SimulatedFill] = []
         self.total_fees_paid = 0.0
+        self.default_fee_rate_bps = default_fee_rate_bps
 
         # Statistics
         self.total_fills = 0
         self.total_rejections = 0
         self.rejection_reasons: Dict[str, int] = {}
+
+    def calculate_fee_per_share(self, probability: float, fee_rate_bps: int = None) -> float:
+        """Calculate Polymarket fee per share using probability-dependent formula.
+
+        Formula: fee(p) = p × (1 − p) × r
+        Where:
+            p = probability/price (0.01 to 0.99)
+            r = fee_rate_bps / 10000 (convert basis points to decimal)
+
+        Fee peaks at p=0.50 (~1.56% effective for fee_rate_bps=625)
+        Fee drops toward 0% at extremes (p→0.01 or p→0.99)
+
+        Args:
+            probability: Current probability/price (0.01 to 0.99)
+            fee_rate_bps: Fee rate in basis points (default: use self.default_fee_rate_bps)
+
+        Returns:
+            Fee per share in USDC
+        """
+        if fee_rate_bps is None:
+            fee_rate_bps = self.default_fee_rate_bps
+
+        # Clamp probability to valid range
+        p = max(0.01, min(0.99, probability))
+        r = fee_rate_bps / 10000.0
+        return p * (1 - p) * r
 
     def simulate_order_fill(
         self,
@@ -55,6 +85,8 @@ class SimulatedOrderExecutor:
         current_ask: float,
         spread: float,
         order_book_imbalance: float,  # [-1, 1]: negative = more sellers, positive = more buyers
+        order_type: str = "GTC",  # "GTC" (Good-Til-Cancelled) or "FOK" (Fill-Or-Kill)
+        limit_price: Optional[float] = None,  # Limit price for FOK orders
     ) -> Dict[str, Any]:
         """Simulate whether order fills and at what price.
 
@@ -67,6 +99,8 @@ class SimulatedOrderExecutor:
             current_ask: Best ask price
             spread: Bid-ask spread
             order_book_imbalance: Order book pressure [-1, 1]
+            order_type: "GTC" (Good-Til-Cancelled) or "FOK" (Fill-Or-Kill)
+            limit_price: Limit price for FOK orders (required for FOK)
 
         Returns:
             Dict with keys:
@@ -75,9 +109,42 @@ class SimulatedOrderExecutor:
                 - slippage (float): Difference from base price
                 - reason (str): Fill/rejection reason
                 - balance_remaining (float): Balance after fill
+                - order_type (str): Order type used
+        """
+        # Route to appropriate order type handler
+        if order_type == "FOK":
+            return self._simulate_fok_order(
+                side, asset, size, current_prob, current_bid, current_ask,
+                spread, order_book_imbalance, limit_price
+            )
+        else:  # GTC or other market orders
+            return self._simulate_gtc_order(
+                side, asset, size, current_prob, current_bid, current_ask,
+                spread, order_book_imbalance, order_type
+            )
+
+    def _simulate_gtc_order(
+        self,
+        side: str,
+        asset: str,
+        size: float,
+        current_prob: float,
+        current_bid: float,
+        current_ask: float,
+        spread: float,
+        order_book_imbalance: float,
+        order_type: str
+    ) -> Dict[str, Any]:
+        """Simulate GTC (Good-Til-Cancelled) market order.
+
+        GTC orders are more flexible and have higher fill rates.
         """
         # 1. Check balance (including estimated fees)
-        estimated_fee = size * 0.002  # 0.2% taker fee (typical Polymarket)
+        # Use probability-dependent fee formula: fee(p) = p × (1 − p) × r
+        base_price = current_prob if side == "BUY" else (1 - current_prob)
+        fee_per_share = self.calculate_fee_per_share(base_price)
+        estimated_shares = size / base_price if base_price > 0 else 0
+        estimated_fee = fee_per_share * estimated_shares
         total_cost = size + estimated_fee
 
         if total_cost > self.balance:
@@ -87,7 +154,8 @@ class SimulatedOrderExecutor:
                 "fill_price": 0.0,
                 "slippage": 0.0,
                 "reason": "insufficient_balance",
-                "balance_remaining": self.balance
+                "balance_remaining": self.balance,
+                "order_type": order_type
             }
 
         # 2. Simulate liquidity constraints
@@ -109,7 +177,8 @@ class SimulatedOrderExecutor:
                 "fill_price": 0.0,
                 "slippage": 0.0,
                 "reason": "no_liquidity",
-                "balance_remaining": self.balance
+                "balance_remaining": self.balance,
+                "order_type": order_type
             }
 
         # 3. Simulate fill price with realistic slippage
@@ -145,8 +214,9 @@ class SimulatedOrderExecutor:
             fill_price = base_price * (1 + slippage_bps / 10000)
             fill_price = min(fill_price, 0.99)  # DOWN token also capped at 0.99
 
-        # 4. Calculate actual costs
-        actual_fee = size * 0.002
+        # 4. Calculate actual costs using probability-dependent fees
+        shares = size / fill_price
+        actual_fee = self.calculate_fee_per_share(fill_price) * shares
         total_cost = size + actual_fee
 
         # 5. Update balance
@@ -171,7 +241,163 @@ class SimulatedOrderExecutor:
             "fill_price": fill_price,
             "slippage": fill_price - base_price,
             "reason": "success",
-            "balance_remaining": self.balance
+            "balance_remaining": self.balance,
+            "order_type": order_type
+        }
+
+    def _simulate_fok_order(
+        self,
+        side: str,
+        asset: str,
+        size: float,
+        current_prob: float,
+        current_bid: float,
+        current_ask: float,
+        spread: float,
+        order_book_imbalance: float,
+        limit_price: Optional[float]
+    ) -> Dict[str, Any]:
+        """Simulate FOK (Fill-Or-Kill) order.
+
+        FOK orders must:
+        1. Fill completely and immediately
+        2. Fill at limit price or better
+        3. Otherwise get rejected (killed)
+
+        Characteristics:
+        - Higher rejection rate than GTC (stricter requirements)
+        - No slippage beyond limit price
+        - Instant execution or rejection
+        """
+        order_type = "FOK"
+
+        # 1. Check balance (including estimated fees)
+        # Use probability-dependent fee formula
+        base_price = current_prob if side == "BUY" else (1 - current_prob)
+        fee_per_share = self.calculate_fee_per_share(base_price)
+        estimated_shares = size / base_price if base_price > 0 else 0
+        estimated_fee = fee_per_share * estimated_shares
+        total_cost = size + estimated_fee
+
+        if total_cost > self.balance:
+            self._record_rejection("insufficient_balance", side, asset, size)
+            return {
+                "filled": False,
+                "fill_price": 0.0,
+                "slippage": 0.0,
+                "reason": "insufficient_balance",
+                "balance_remaining": self.balance,
+                "order_type": order_type
+            }
+
+        # 2. Validate limit price
+        if limit_price is None:
+            self._record_rejection("fok_no_limit_price", side, asset, size)
+            return {
+                "filled": False,
+                "fill_price": 0.0,
+                "slippage": 0.0,
+                "reason": "fok_no_limit_price",
+                "balance_remaining": self.balance,
+                "order_type": order_type
+            }
+
+        # 3. Check if limit price is achievable
+        if side == "BUY":
+            # BUY: can we get price <= limit_price?
+            best_available = current_ask if current_ask > 0 else current_prob
+            if best_available > limit_price:
+                self._record_rejection("fok_price_not_met", side, asset, size)
+                return {
+                    "filled": False,
+                    "fill_price": 0.0,
+                    "slippage": 0.0,
+                    "reason": "fok_price_not_met",
+                    "balance_remaining": self.balance,
+                    "order_type": order_type
+                }
+            base_price = best_available
+        else:  # SELL
+            # SELL (DOWN token): can we get price <= limit_price?
+            best_available = 1 - current_bid if current_bid > 0 else 1 - current_prob
+            if best_available > limit_price:
+                self._record_rejection("fok_price_not_met", side, asset, size)
+                return {
+                    "filled": False,
+                    "fill_price": 0.0,
+                    "slippage": 0.0,
+                    "reason": "fok_price_not_met",
+                    "balance_remaining": self.balance,
+                    "order_type": order_type
+                }
+            base_price = best_available
+
+        # 4. Simulate immediate fill probability
+        # FOK has stricter requirements - must fill immediately
+        fok_base_fill_rate = 0.80  # Lower than GTC's 0.95
+
+        # Penalties
+        spread_penalty = min(spread / 0.05, 1.0)
+        size_penalty = min(size / 100, 0.6)  # Larger orders harder to fill immediately
+
+        # Imbalance penalty: if market is moving against us
+        if side == "BUY" and order_book_imbalance > 0:  # Buying into demand
+            imbalance_penalty = order_book_imbalance * 0.3
+        elif side == "SELL" and order_book_imbalance < 0:  # Selling into supply
+            imbalance_penalty = -order_book_imbalance * 0.3
+        else:
+            imbalance_penalty = 0.0
+
+        fill_probability = fok_base_fill_rate * (1 - 0.4 * spread_penalty) * (1 - 0.3 * size_penalty) * (1 - imbalance_penalty)
+
+        if np.random.random() > fill_probability:
+            self._record_rejection("fok_no_immediate_fill", side, asset, size)
+            return {
+                "filled": False,
+                "fill_price": 0.0,
+                "slippage": 0.0,
+                "reason": "fok_no_immediate_fill",
+                "balance_remaining": self.balance,
+                "order_type": order_type
+            }
+
+        # 5. Fill at limit price or better
+        # FOK fills at best available price up to limit
+        # Simulate small price improvement possibility
+        price_improvement_bps = np.random.uniform(0, 5)  # 0-5 bps improvement possible
+        fill_price = base_price * (1 - price_improvement_bps / 10000)
+        fill_price = max(fill_price, 0.01)  # Floor at 0.01
+
+        # Ensure we don't exceed limit
+        fill_price = min(fill_price, limit_price)
+
+        # 6. Update balance using probability-dependent fees
+        shares = size / fill_price
+        actual_fee = self.calculate_fee_per_share(fill_price) * shares
+        total_cost = size + actual_fee
+        self.balance -= total_cost
+        self.total_fees_paid += actual_fee
+
+        # 7. Record fill
+        fill = SimulatedFill(
+            timestamp=datetime.now(timezone.utc),
+            side=side,
+            asset=asset,
+            size=size,
+            fill_price=fill_price,
+            slippage=fill_price - base_price,
+            reason="success"
+        )
+        self.fills_history.append(fill)
+        self.total_fills += 1
+
+        return {
+            "filled": True,
+            "fill_price": fill_price,
+            "slippage": fill_price - base_price,
+            "reason": "success",
+            "balance_remaining": self.balance,
+            "order_type": order_type
         }
 
     def realize_pnl(self, pnl: float):
