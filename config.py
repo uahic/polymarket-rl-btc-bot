@@ -33,11 +33,12 @@ Example:
 
 import os
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from dataclasses import asdict
 import yaml
 
+from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
 
 # Environment variable prefix
 ENV_PREFIX = "POLY_"
@@ -92,17 +93,11 @@ class ConfigNotFoundError(ConfigError):
     pass
 
 
-@dataclass
-class BuilderConfig:
-    """Builder Program configuration for gasless transactions."""
-
-    api_key: str = ""
-    api_secret: str = ""
-    api_passphrase: str = ""
-
-    def is_configured(self) -> bool:
-        """Check if Builder credentials are configured."""
-        return bool(self.api_key and self.api_secret and self.api_passphrase)
+# BuilderConfig is now imported from py_builder_signing_sdk.config
+# We keep a helper function to check if builder config is set up
+def is_builder_configured(builder_config: Optional[BuilderConfig]) -> bool:
+    """Check if Builder credentials are configured."""
+    return builder_config is not None
 
 
 @dataclass
@@ -111,7 +106,8 @@ class ClobConfig:
 
     host: str = "https://clob.polymarket.com"
     chain_id: int = 137
-    signature_type: int = 2  # Gnosis Safe
+    # signature_type: int = 2  # Gnosis Safe
+    signature_type: int = 1  # POLY_PROXY
 
     def is_valid(self) -> bool:
         """Validate CLOB configuration."""
@@ -153,7 +149,7 @@ class Config:
     # API configurations
     clob: ClobConfig = field(default_factory=ClobConfig)
     relayer: RelayerConfig = field(default_factory=RelayerConfig)
-    builder: BuilderConfig = field(default_factory=BuilderConfig)
+    builder: Optional[BuilderConfig] = None
 
     # Trading defaults
     default_token_id: str = ""
@@ -177,7 +173,7 @@ class Config:
         if self.safe_address:
             self.safe_address = self.safe_address.lower()
         # Auto-enable gasless if builder is configured
-        if self.builder.is_configured():
+        if is_builder_configured(self.builder):
             self.use_gasless = True
 
     @classmethod
@@ -234,11 +230,17 @@ class Config:
         # Builder config
         if "builder" in data:
             builder_data = data["builder"]
-            config.builder = BuilderConfig(
-                api_key=builder_data.get("api_key", ""),
-                api_secret=builder_data.get("api_secret", ""),
-                api_passphrase=builder_data.get("api_passphrase", ""),
-            )
+            api_key = builder_data.get("api_key", "")
+            api_secret = builder_data.get("api_secret", "")
+            api_passphrase = builder_data.get("api_passphrase", "")
+
+            if api_key and api_secret and api_passphrase:
+                creds = BuilderApiKeyCreds(
+                    key=api_key,
+                    secret=api_secret,
+                    passphrase=api_passphrase
+                )
+                config.builder = BuilderConfig(local_builder_creds=creds)
 
         # Trading defaults
         if "default_token_id" in data:
@@ -257,7 +259,7 @@ class Config:
             config.log_level = data["log_level"]
 
         # Auto-detect gasless mode
-        config.use_gasless = config.builder.is_configured()
+        config.use_gasless = is_builder_configured(config.builder)
 
         return config
 
@@ -296,20 +298,24 @@ class Config:
         api_key = get_env("BUILDER_API_KEY")
         api_secret = get_env("BUILDER_API_SECRET")
         api_passphrase = get_env("BUILDER_API_PASSPHRASE")
-        if api_key or api_secret or api_passphrase:
-            config.builder = BuilderConfig(
-                api_key=api_key,
-                api_secret=api_secret,
-                api_passphrase=api_passphrase,
+        if api_key and api_secret and api_passphrase:
+            creds = BuilderApiKeyCreds(
+                key=api_key,
+                secret=api_secret,
+                passphrase=api_passphrase
             )
+            config.builder = BuilderConfig(local_builder_creds=creds)
 
         # CLOB config
         clob_host = get_env("CLOB_HOST")
         chain_id = get_env_int("CHAIN_ID", 137)
-        if clob_host:
+        signature_type = get_env_int("SIGNATURE_TYPE", 1)
+
+        if clob_host or signature_type != 2:
             config.clob = ClobConfig(
-                host=clob_host,
+                host=clob_host or config.clob.host,
                 chain_id=chain_id,
+                signature_type=signature_type,
             )
         elif chain_id != 137:
             config.clob.chain_id = chain_id
@@ -337,61 +343,62 @@ class Config:
             config.order_type = order_type
 
         # Auto-detect gasless mode
-        config.use_gasless = config.builder.is_configured()
+        config.use_gasless = is_builder_configured(config.builder)
 
         return config
 
-    @classmethod
-    def load_with_env(cls, filepath: str = "config.yaml") -> "Config":
-        """
-        Load configuration from YAML file with environment variable overrides.
+    # @classmethod
+    # def load_with_env(cls, filepath: str = "config.yaml") -> "Config":
+    #     """
+    #     Load configuration from YAML file with environment variable overrides.
 
-        Args:
-            filepath: Path to YAML config file
+    #     Args:
+    #         filepath: Path to YAML config file
 
-        Returns:
-            Config instance with env vars taking precedence
-        """
-        # Start with YAML config if it exists
-        path = Path(filepath)
-        if path.exists():
-            config = cls.load(filepath)
-        else:
-            config = cls()
+    #     Returns:
+    #         Config instance with env vars taking precedence
+    #     """
+    #     # Start with YAML config if it exists
+    #     path = Path(filepath)
+    #     if path.exists():
+    #         config = cls.load(filepath)
+    #     else:
+    #         config = cls()
 
-        # Override with environment variables
-        safe_address = get_env("SAFE_ADDRESS")
-        if safe_address:
-            config.safe_address = safe_address.lower()
+    #     # Override with environment variables
+    #     safe_address = get_env("SAFE_ADDRESS")
+    #     if safe_address:
+    #         config.safe_address = safe_address.lower()
 
-        rpc_url = get_env("RPC_URL")
-        if rpc_url:
-            config.rpc_url = rpc_url
+    #     rpc_url = get_env("RPC_URL")
+    #     if rpc_url:
+    #         config.rpc_url = rpc_url
 
-        # Builder credentials from env override YAML
-        api_key = get_env("BUILDER_API_KEY")
-        api_secret = get_env("BUILDER_API_SECRET")
-        api_passphrase = get_env("BUILDER_API_PASSPHRASE")
-        if api_key:
-            config.builder.api_key = api_key
-        if api_secret:
-            config.builder.api_secret = api_secret
-        if api_passphrase:
-            config.builder.api_passphrase = api_passphrase
+    #     # Builder credentials from env override YAML
+    #     api_key = get_env("BUILDER_API_KEY")
+    #     api_secret = get_env("BUILDER_API_SECRET")
+    #     api_passphrase = get_env("BUILDER_API_PASSPHRASE")
+    #     if api_key and api_secret and api_passphrase:
+    #         creds = BuilderApiKeyCreds(
+    #             key=api_key,
+    #             secret=api_secret,
+    #             passphrase=api_passphrase
+    #         )
+    #         config.builder = BuilderConfig(local_builder_creds=creds)
 
-        # Other settings
-        data_dir = get_env("DATA_DIR")
-        if data_dir:
-            config.data_dir = data_dir
+    #     # Other settings
+    #     data_dir = get_env("DATA_DIR")
+    #     if data_dir:
+    #         config.data_dir = data_dir
 
-        log_level = get_env("LOG_LEVEL")
-        if log_level:
-            config.log_level = log_level.upper()
+    #     log_level = get_env("LOG_LEVEL")
+    #     if log_level:
+    #         config.log_level = log_level.upper()
 
-        # Re-check gasless mode
-        config.use_gasless = config.builder.is_configured()
+    #     # Re-check gasless mode
+    #     config.use_gasless = config.builder.is_configured()
 
-        return config
+    #     return config
 
     def save(self, filepath: str = "config.yaml") -> None:
         """Save configuration to YAML file."""
@@ -404,12 +411,23 @@ class Config:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
+        # Extract builder credentials if present
+        builder_dict = {}
+        if self.builder and hasattr(self.builder, 'local_builder_creds'):
+            creds = self.builder.local_builder_creds
+            if creds:
+                builder_dict = {
+                    "api_key": creds.key,
+                    "api_secret": creds.secret,
+                    "api_passphrase": creds.passphrase,
+                }
+
         return {
             "safe_address": self.safe_address,
             "rpc_url": self.rpc_url,
             "clob": asdict(self.clob),
             "relayer": asdict(self.relayer),
-            "builder": asdict(self.builder),
+            "builder": builder_dict,
             "default_token_id": self.default_token_id,
             "default_size": self.default_size,
             "default_price": self.default_price,
@@ -435,7 +453,7 @@ class Config:
         if not self.clob.is_valid():
             errors.append("clob configuration is invalid")
 
-        if self.use_gasless and not self.builder.is_configured():
+        if self.use_gasless and not is_builder_configured(self.builder):
             errors.append("gasless mode enabled but builder credentials not configured")
 
         return errors

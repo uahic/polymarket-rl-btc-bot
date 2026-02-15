@@ -25,7 +25,8 @@ from eth_account import Account
 import yaml
 
 from security.key_store import EncryptedKeyStore, verify_private_key
-from config import Config, BuilderConfig
+from config import Config
+from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
 
 
 
@@ -160,11 +161,17 @@ def create_config(
     )
 
     if builder_creds:
-        config.builder = BuilderConfig(
-            api_key=builder_creds.get("api_key", ""),
-            api_secret=builder_creds.get("api_secret", ""),
-            api_passphrase=builder_creds.get("api_passphrase", ""),
-        )
+        api_key = builder_creds.get("api_key", "")
+        api_secret = builder_creds.get("api_secret", "")
+        api_passphrase = builder_creds.get("api_passphrase", "")
+
+        if api_key and api_secret and api_passphrase:
+            creds = BuilderApiKeyCreds(
+                key=api_key,
+                secret=api_secret,
+                passphrase=api_passphrase
+            )
+            config.builder = BuilderConfig(local_builder_creds=creds)
 
     return config
 

@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import to_checksum_address, is_address
+from py_clob_client.signer import Signer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from structures.order import Order, OrderSide
@@ -17,18 +18,18 @@ class SignerError(Exception):
     pass
 
 
-class OrderSigner:
+class OrderSigner(Signer):
     """
     Signs Polymarket orders using EIP-712.
-    This is used to derive L2 credentials which can be used in the TransactionClient
+    Extends py_clob_client.signer.Signer for compatibility with py_clob_client header functions.
 
     This signer handles:
     - Authentication messages (L1)
     - Order messages (for CLOB submission)
 
     Attributes:
-        wallet: The Ethereum wallet instance
-        address: The signer's address
+        wallet: The Ethereum wallet instance (inherited from parent Signer)
+        address: The signer's address (property from parent Signer)
         domain: EIP-712 domain separator
     """
 
@@ -70,12 +71,13 @@ class OrderSigner:
         if private_key.startswith("0x"):
             private_key = private_key[2:]
 
+        # Initialize parent Signer class (py_clob_client)
         try:
-            self.wallet = Account.from_key(f"0x{private_key}")
+            super().__init__(private_key=private_key, chain_id=137)
         except Exception as e:
             raise ValueError(f"Invalid private key: {e}")
 
-        self.address = self.wallet.address
+        # wallet is inherited from parent Signer class
 
     def sign_auth_message(self, timestamp: Optional[str] = None, nonce: int = 0) -> str:
         """
@@ -104,7 +106,7 @@ class OrderSigner:
         }
 
         message_data = {
-            "address": self.address,
+            "address": self.address(),
             "timestamp": timestamp,
             "nonce": nonce,
             "message": "This message attests that I control the given wallet",
@@ -179,7 +181,7 @@ class OrderSigner:
             order_message = {
                 "salt": salt,
                 "maker": to_checksum_address(order.maker),
-                "signer": self.address,
+                "signer": self.address(),
                 "taker": taker,
                 "tokenId": token_id_int,
                 "makerAmount": maker_amount_int,
@@ -204,7 +206,7 @@ class OrderSigner:
                 "order": {
                     "salt": salt,
                     "maker": to_checksum_address(order.maker),
-                    "signer": self.address,
+                    "signer": self.address(),
                     "taker": taker,
                     "tokenId": order.token_id,
                     "makerAmount": order.maker_amount,

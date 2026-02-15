@@ -52,6 +52,9 @@ class MarketState:
     pending_order_age: float = 0.0  # Time since order placed (0-1, normalized)
     consecutive_failures: int = 0  # Track repeated failures
 
+    # Capital Management
+    available_balance: float = 0.0  # Current USDC allowance/balance
+
     # Volatility (short-term)
     realized_vol_5m: float = 0.0
     vol_expansion: float = 0.0  # Current vol vs recent average
@@ -61,7 +64,7 @@ class MarketState:
     trend_regime: float = 0.0  # Trending or ranging
 
     def to_features(self) -> np.ndarray:
-        """Convert to feature vector for ML models. Returns 18 features normalized to [-1, 1]."""
+        """Convert to feature vector for ML models. Returns 22 features normalized to [-1, 1]."""
         velocity = self._velocity(3)  # Shorter window
         vol_5m = self._volatility(30)  # ~5 min of ticks
 
@@ -108,6 +111,9 @@ class MarketState:
             float(1.0 if self.last_action_status == "pending" else 0.0),
             float(1.0 if self.last_action_status == "failed" else 0.0),
             clamp(self.consecutive_failures / 5.0),  # Normalize by max expected failures
+
+            # Capital Management (1)
+            clamp(self.available_balance / 1000),  # Normalize by typical bankroll ($1000)
         ], dtype=np.float32)
 
     def _velocity(self, window: int = 5) -> float:

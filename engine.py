@@ -8,7 +8,7 @@ from typing import Dict, Optional, Any, List
 sys.path.insert(0, str(Path(__file__).parent))
 
 from logger.training_logger import get_logger
-from config import Config
+from config import Config, is_builder_configured
 from strategies import BaseStrategy, MLStrategy
 from streams.binance import BinanceStreamer
 from streams.orderbook import OrderbookStreamer
@@ -17,11 +17,23 @@ from streams.polymarket_api import Market, get_15m_markets
 from structures.market import MarketState
 from structures.action import Action
 from structures.position import Position
-from structures.order import Order, OrderSide
-from security.order_signer import OrderSigner
+
+# from structures.order import Order, OrderSide
+from py_clob_client.signer import Signer
+from py_clob_client.clob_types import OrderArgs, CreateOrderOptions
+from py_clob_client.order_builder.constants import BUY as ORDER_BUY, SELL as ORDER_SELL
 from config_loader import decrypt_private_key
-from transactions.transaction_client import TransactionClient
-from transactions.async_http import OrderError
+
+# from transactions.transaction_client import TransactionClient
+from transactions.async_client import AsyncClobClient
+from simulation.executor import SimulatedOrderExecutor
+
+
+class OrderError(Exception):
+    """Raised when order operations fail."""
+
+    pass
+
 
 # Dashboard integration (optional)
 try:
@@ -61,11 +73,15 @@ class TradingEngine:
         config: Config,
         trade_size: float = 10.0,
         live_trading: bool = False,
+        simulation_mode: bool = True,
+        initial_balance: Optional[float] = None,
     ):
         self.strategy = strategy
         self.trade_size = trade_size
         self.config = config
         self.live_trading = live_trading
+        self.simulation_mode = simulation_mode and not live_trading  # Simulation only for paper trading
+        self.initial_balance_override = initial_balance  # If None, fetch from API
 
         # Streamers
         # self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
@@ -75,35 +91,47 @@ class TradingEngine:
         self.futures_streamer = FuturesStreamer(["BTC"])
 
         # Order management (initialized only if live_trading=True)
-        self.order_signer: Optional[OrderSigner] = None
-        self.transaction_client: Optional[TransactionClient] = None
+        self.signer: Optional[Signer] = None
+        self.transaction_client: Optional[AsyncClobClient] = None
 
         # Order tracking
         self.pending_orders: Dict[str, Dict[str, Any]] = (
             {}
         )  # cid -> {order_id, side, size, price}
         self.order_timestamps: Dict[str, float] = {}  # cid -> unix_timestamp
-        self.order_type: str = "GTC"  # "GTC" or "FOK"
+        self.order_type = getattr(config, "order_type", "GTC")
+        self.order_options = CreateOrderOptions(tick_size="0.01", neg_risk=False)
 
         # Initialize live trading components
         if self.live_trading:
             # Load private key and initialize signer
             private_key = decrypt_private_key()
-            self.order_signer = OrderSigner(private_key)
+            self.signer = Signer(private_key=private_key, chain_id=config.clob.chain_id)
 
             # Initialize async CLOB client
             # Use checksummed address from signer for consistency with API credentials
-            self.transaction_client = TransactionClient(
+            # self.transaction_client = TransactionClient(
+            #     host=config.clob.host,
+            #     chain_id=config.clob.chain_id,
+            #     signature_type=config.clob.signature_type,
+            #     funder=self.signer.address(),  # Use checksummed address
+            #     builder_creds=(
+            #         config.builder if config.builder.is_configured() else None
+            #     ),
+            #     signer=self.signer,  # Pass signer for header creation
+            # )
+            self.transaction_client = AsyncClobClient(
                 host=config.clob.host,
                 chain_id=config.clob.chain_id,
+                key=private_key,
+                creds=None,
                 signature_type=config.clob.signature_type,
-                funder=self.order_signer.address,  # Use checksummed address
-                builder_creds=(
-                    config.builder if config.builder.is_configured() else None
+                funder=config.safe_address,  # Use Safe address, not EOA
+                builder_config=(
+                    config.builder if is_builder_configured(config.builder) else None
                 ),
             )
 
-            self.order_type = getattr(config, "order_type", "GTC")
             print(f"[LIVE TRADING] Mode enabled, using {self.order_type} orders")
 
         # State
@@ -124,6 +152,12 @@ class TradingEngine:
 
         # Logger (for RL training)
         self.logger = get_logger() if isinstance(strategy, MLStrategy) else None
+
+        # Simulated order executor (for paper trading with realistic fills)
+        self.order_executor: Optional[SimulatedOrderExecutor] = None
+        if self.simulation_mode:
+            # Will be initialized in run() after we optionally fetch balance from API
+            self.order_executor = None  # Initialized later
 
     def refresh_markets(self):
         """Find active 15-min markets."""
@@ -186,7 +220,7 @@ class TradingEngine:
             self._execute_action_paper(cid, action, state)
 
     def _execute_action_paper(self, cid: str, action: Action, state: MarketState):
-        """Execute paper trade with flexible sizing."""
+        """Execute simulated trade with realistic fills, slippage, and balance tracking."""
         pos = self.positions.get(cid)
         if not pos:
             return
@@ -201,51 +235,85 @@ class TradingEngine:
                 pnl = (price - pos.entry_price) * shares
                 self._record_trade(pos, price, pnl, "CLOSE UP", cid=cid)
                 self.pending_rewards[cid] = pnl  # Pure realized PnL reward
+
+                # Return capital to simulator
+                if self.order_executor:
+                    self.order_executor.realize_pnl(pos.size + pnl)
+
                 pos.size = 0
                 pos.side = None
                 return
 
             elif action.is_buy and pos.side == "DOWN":
-                exit_down_price = 1 - price  # Current DOWN token price
+                exit_down_price = 1 - price
                 shares = pos.size / pos.entry_price
-                pnl = (
-                    exit_down_price - pos.entry_price
-                ) * shares  # DOWN token went up = profit
+                pnl = (exit_down_price - pos.entry_price) * shares
                 self._record_trade(pos, price, pnl, "CLOSE DOWN", cid=cid)
-                self.pending_rewards[cid] = pnl  # Pure realized PnL reward
+                self.pending_rewards[cid] = pnl
+
+                # Return capital to simulator
+                if self.order_executor:
+                    self.order_executor.realize_pnl(pos.size + pnl)
+
                 pos.size = 0
                 pos.side = None
                 return
 
-        # Open new position
+        # Open new position with simulated fill
         if pos.size == 0:
-            size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(
-                action.size_multiplier, ""
+            size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(action.size_multiplier, "")
+
+            side = "BUY" if action.is_buy else "SELL"
+            fill_result = self.order_executor.simulate_order_fill(
+                side=side,
+                asset=pos.asset,
+                size=trade_amount,
+                current_prob=price,
+                current_bid=state.best_bid,
+                current_ask=state.best_ask,
+                spread=state.spread,
+                order_book_imbalance=state.order_book_imbalance_l1,
             )
+
+            if not fill_result["filled"]:
+                # Order rejected
+                print(f"    ✗ REJECTED: {fill_result['reason']} (bal: ${fill_result['balance_remaining']:.2f})")
+                state.last_action_status = "failed"
+                state.consecutive_failures += 1
+                return
+
+            # Order filled
+            fill_price = fill_result["fill_price"]
+            slippage_bps = fill_result["slippage"] * 10000
 
             if action.is_buy:
                 pos.side = "UP"
                 pos.size = trade_amount
-                pos.entry_price = price
+                pos.entry_price = fill_price
                 pos.entry_time = datetime.now(timezone.utc)
                 pos.entry_prob = price
                 pos.time_remaining_at_entry = state.time_remaining
                 print(
-                    f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {price:.3f}"
+                    f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {fill_price:.3f} "
+                    f"(slip: {slippage_bps:+.1f}bps, bal: ${fill_result['balance_remaining']:.2f})"
                 )
                 emit_trade(f"BUY_{size_label}", pos.asset, pos.size)
 
             elif action.is_sell:
                 pos.side = "DOWN"
                 pos.size = trade_amount
-                pos.entry_price = 1 - price  # DOWN token price = 1 - UP prob
+                pos.entry_price = fill_price
                 pos.entry_time = datetime.now(timezone.utc)
-                pos.entry_prob = price  # Keep original UP prob for reference
+                pos.entry_prob = price
                 pos.time_remaining_at_entry = state.time_remaining
                 print(
-                    f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {1 - price:.3f}"
+                    f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {fill_price:.3f} "
+                    f"(slip: {slippage_bps:+.1f}bps, bal: ${fill_result['balance_remaining']:.2f})"
                 )
                 emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
+
+            state.last_action_status = "success"
+            state.consecutive_failures = 0
 
     async def _execute_action_live(self, cid: str, action: Action, state: MarketState):
         """Execute live order via CLOB API."""
@@ -284,11 +352,35 @@ class TradingEngine:
                 )
 
         except OrderError as e:
-            print(f"  [ORDER ERROR] {m.asset}: {e}")
-            self._handle_order_failure(cid, str(e))
+            error_msg = str(e)
+            print(f"  [ORDER ERROR] {m.asset}: {error_msg}")
+            # Check for balance/allowance error
+            if "not enough balance" in error_msg.lower() or "allowance" in error_msg.lower():
+                print(f"  [BALANCE] Insufficient funds - skipping trades for now")
+                # Clear pending order if it was tracked
+                if cid in self.pending_orders:
+                    del self.pending_orders[cid]
+                if cid in self.order_timestamps:
+                    del self.order_timestamps[cid]
+            else:
+                import traceback
+                traceback.print_exc()
+            self._handle_order_failure(cid, error_msg)
         except Exception as e:
-            print(f"  [ERROR] {m.asset}: {e}")
-            self._handle_order_failure(cid, str(e))
+            error_msg = str(e)
+            print(f"  [ERROR] {m.asset}: {error_msg}")
+            # Check for balance/allowance error in exception
+            if "not enough balance" in error_msg.lower() or "allowance" in error_msg.lower():
+                print(f"  [BALANCE] Insufficient funds - skipping trades for now")
+                # Clear pending order if it was tracked
+                if cid in self.pending_orders:
+                    del self.pending_orders[cid]
+                if cid in self.order_timestamps:
+                    del self.order_timestamps[cid]
+            else:
+                import traceback
+                traceback.print_exc()
+            self._handle_order_failure(cid, error_msg)
 
     async def _open_position_live(
         self,
@@ -300,35 +392,53 @@ class TradingEngine:
     ):
         """Open new position with live order."""
 
+        # Check if there's already a pending order for this market
+        if cid in self.pending_orders:
+            pending = self.pending_orders[cid]
+            if not pending.get("is_close"):
+                print(f"    [SKIP] Open order already pending")
+                return
+
         # Determine token and side
         if action.is_buy:
             token_id = market.token_up
-            side = OrderSide.BUY
+            side = ORDER_BUY
             price = state.prob
             position_side = "UP"
         else:  # action.is_sell
             token_id = market.token_down
-            side = OrderSide.BUY  # Buy DOWN token
+            side = ORDER_BUY  # Buy DOWN token
             price = 1 - state.prob
             position_side = "DOWN"
 
         # Calculate shares
         size = trade_amount / price
 
-        # Sign and submit order
-        signed_order = self.order_signer.sign_order_dict(
+        # Create order using py_clob_client
+        order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=size,
             side=side,
-            maker=self.config.safe_address,
-            nonce=None,
             fee_rate_bps=0,
+            nonce=0,
         )
 
-        response = await self.transaction_client.post_order(
-            signed_order=signed_order, order_type=self.order_type
+        # Use transaction_client's order_builder to create signed order
+
+        # signed_order = self.transaction_client.order_builder.create_order(
+        #     order_args, order_options
+        # )
+        signed_order = await self.transaction_client.create_order(
+            order_args, self.order_options
         )
+        response = await self.transaction_client.post_order(
+            signed_order, self.order_type
+        )
+
+        # response = await self.transaction_client.post_order(
+        #     signed_order=signed_order, order_type=self.order_type
+        # )
 
         # Track order if GTC
         if self.order_type == "GTC":
@@ -365,6 +475,11 @@ class TradingEngine:
         self, cid: str, pos: Position, state: MarketState, side: str
     ):
         """Close position by selling tokens."""
+        # Check if there's already a pending close order for this market
+        if cid in self.pending_orders and self.pending_orders[cid].get("is_close"):
+            print(f"    [SKIP] Close order already pending for {side}")
+            return
+
         m = self.markets[cid]
 
         # Determine token and price
@@ -374,31 +489,51 @@ class TradingEngine:
         # Calculate shares
         shares = pos.size / pos.entry_price
 
-        # Sign and submit SELL order (use FOK for exits)
-        signed_order = self.order_signer.sign_order_dict(
+        # Create SELL order using py_clob_client (use FOK for exits)
+        order_args = OrderArgs(
             token_id=token_id,
             price=exit_price,
             size=shares,
-            side=OrderSide.SELL,
-            maker=self.config.safe_address,
-            nonce=None,
+            side=ORDER_SELL,
             fee_rate_bps=0,
+            nonce=0,
         )
 
-        await self.transaction_client.post_order(signed_order, order_type="FOK")
+        # Create order options
 
-        # Calculate PnL
-        pnl = (exit_price - pos.entry_price) * shares
+        # signed_order = await self.transaction_client.create_order(
+        #     order_args, self.order_options
+        # )
+        # response = await self.transaction_client.post_order(
+        #     signed_order, orderType="GTC"
+        # )
+        response = await self.transaction_client.create_and_post_order(order_args, self.order_options)
+        # signed_order = self.transaction_client.order_builder.create_order(
+        #     order_args, order_options
+        # )
+        # await self.transaction_client.post_order(signed_order, order_type="GTC")
 
-        # Record and clear position
-        self._record_trade(pos, exit_price, pnl, f"CLOSE {side}", cid=cid)
-        self.pending_rewards[cid] = pnl
-        pos.size = 0
-        pos.side = None
+        # Check if order was posted successfully
+        order_id = response.get("orderID")
+        if not order_id:
+            raise OrderError("GTC close order failed - no orderID returned")
 
-        # Update state
-        state.last_action_status = "success"
+        # Track as pending close order
+        self.pending_orders[cid] = {
+            "order_id": order_id,
+            "side": side,
+            "size": pos.size,
+            "price": exit_price,
+            "shares": shares,
+            "is_close": True,  # Mark this as a closing order
+        }
+        self.order_timestamps[cid] = datetime.now(timezone.utc).timestamp()
+
+        # Update state to pending (position still open until filled)
+        state.last_action_status = "pending"
         state.consecutive_failures = 0
+
+        print(f"    [LIVE] CLOSE {side} order posted @ {exit_price:.3f} (pending fill)")
 
     async def _cancel_pending_order(self, cid: str):
         """Cancel pending GTC order for a market."""
@@ -410,13 +545,133 @@ class TradingEngine:
             return
 
         try:
-            await self.transaction_client.cancel_order(order_id)
-            print(f"    [CANCEL] Order {order_id[:8]}... cancelled")
-            del self.pending_orders[cid]
-            if cid in self.order_timestamps:
-                del self.order_timestamps[cid]
+            # await self.transaction_client.cancel_order(order_id)
+            response = await self.transaction_client.cancel(order_id)
+
+            # Check if cancellation was successful
+            # Response should contain success status or order status
+            if response:
+                # Handle dict response with status field
+                if isinstance(response, dict):
+                    status = response.get("status", "").lower()
+                    if status in ["cancelled", "canceled"]:
+                        print(
+                            f"    [CANCEL] Order {order_id[:8]}... cancelled successfully"
+                        )
+                        del self.pending_orders[cid]
+                        if cid in self.order_timestamps:
+                            del self.order_timestamps[cid]
+                    elif status == "matched":
+                        # Order was already filled before we could cancel
+                        print(f"    [CANCEL] Order {order_id[:8]}... already filled")
+                        # Let the status check handler deal with this
+                        del self.pending_orders[cid]
+                        if cid in self.order_timestamps:
+                            del self.order_timestamps[cid]
+                    elif status == "":
+                        # Empty status - assume cancelled
+                        print(f"    [CANCEL] Order {order_id[:8]}... cancelled (empty status)")
+                        del self.pending_orders[cid]
+                        if cid in self.order_timestamps:
+                            del self.order_timestamps[cid]
+                    else:
+                        print(
+                            f"    [CANCEL] Order {order_id[:8]}... unexpected status: {status}"
+                        )
+                        # Still remove from pending to avoid loops
+                        del self.pending_orders[cid]
+                        if cid in self.order_timestamps:
+                            del self.order_timestamps[cid]
+                else:
+                    # Non-dict response (e.g., string or boolean)
+                    print(f"    [CANCEL] Order {order_id[:8]}... cancelled (non-dict response)")
+                    del self.pending_orders[cid]
+                    if cid in self.order_timestamps:
+                        del self.order_timestamps[cid]
+            else:
+                # Assume success if no response returned
+                print(f"    [CANCEL] Order {order_id[:8]}... cancelled (no response)")
+                del self.pending_orders[cid]
+                if cid in self.order_timestamps:
+                    del self.order_timestamps[cid]
         except Exception as e:
             print(f"    [CANCEL ERROR] {order_id[:8]}...: {e}")
+            # Remove from pending even on error to prevent infinite loops
+            if cid in self.pending_orders:
+                del self.pending_orders[cid]
+            if cid in self.order_timestamps:
+                del self.order_timestamps[cid]
+
+    async def _check_close_order_status(self, cid: str):
+        """Check if a pending close order has been filled."""
+        if cid not in self.pending_orders:
+            return
+
+        pending = self.pending_orders[cid]
+        if not pending.get("is_close"):
+            return
+
+        order_id = pending.get("order_id")
+        if not order_id:
+            return
+
+        try:
+            # Get order status from API
+            order_status = await self.transaction_client.get_order(order_id)
+
+            # Handle case where API returns a string (transaction hash) instead of dict
+            if isinstance(order_status, str):
+                print(f"    [STATUS CHECK] Order {order_id[:8]}... returned tx hash, assuming filled")
+                # Remove from pending and let next iteration handle position state
+                del self.pending_orders[cid]
+                if cid in self.order_timestamps:
+                    del self.order_timestamps[cid]
+                return
+
+            status = order_status.get("status", "").lower()
+
+            # Check if order is filled
+            if status == "matched":
+                # Order filled - finalize the close
+                pos = self.positions.get(cid)
+                state = self.states.get(cid)
+
+                if pos and state and pos.size > 0:  # Only close if position still exists
+                    side = pending["side"]
+                    exit_price = pending["price"]
+                    shares = pending["shares"]
+
+                    # Calculate PnL
+                    pnl = (exit_price - pos.entry_price) * shares
+
+                    # Record and clear position
+                    self._record_trade(pos, exit_price, pnl, f"CLOSE {side}", cid=cid)
+                    self.pending_rewards[cid] = pnl
+                    pos.size = 0
+                    pos.side = None
+
+                    # Update state
+                    state.last_action_status = "success"
+
+                    print(f"    [FILLED] CLOSE {side} order filled @ {exit_price:.3f}")
+
+                # Remove from pending
+                del self.pending_orders[cid]
+                if cid in self.order_timestamps:
+                    del self.order_timestamps[cid]
+
+            elif status in ["cancelled", "expired"]:
+                # Order cancelled/expired - keep position open, remove pending
+                print(f"    [CANCELLED] CLOSE order {status}")
+                del self.pending_orders[cid]
+                if cid in self.order_timestamps:
+                    del self.order_timestamps[cid]
+                state = self.states.get(cid)
+                if state:
+                    state.last_action_status = "failed"
+
+        except Exception as e:
+            print(f"    [STATUS CHECK ERROR] {order_id[:8]}...: {e}")
 
     def _handle_order_failure(self, cid: str, error_msg: str):
         """Handle order failure - fail fast strategy."""
@@ -608,6 +863,12 @@ class TradingEngine:
             )
             state.pending_order_age = min(age_seconds / 900, 1.0)
 
+            # Check order status periodically for close orders
+            if self.live_trading and self.pending_orders[cid].get("is_close"):
+                # Check every 2 seconds for close orders
+                if age_seconds > 0 and int(age_seconds) % 2 == 0:
+                    asyncio.create_task(self._check_close_order_status(cid))
+
             # Auto-cancel stale orders (>5 min) for high-frequency trading
             if age_seconds > 300 and self.live_trading:
                 # Schedule as fire-and-forget task (update_state is NOT async)
@@ -616,6 +877,10 @@ class TradingEngine:
             # Order filled or cancelled
             state.last_action_status = "success"
             state.pending_order_age = 0.0
+
+        # Update available balance from simulator
+        if self.order_executor:
+            state.available_balance = self.order_executor.get_balance()
 
         # consecutive_failures updated in _handle_order_failure
 
@@ -853,19 +1118,54 @@ class TradingEngine:
         self.running = True
 
         # Derive API credentials for authenticated endpoints
-        print(f"[DEBUG] live_trading={self.live_trading}, transaction_client={self.transaction_client is not None}")
+        print(
+            f"[DEBUG] live_trading={self.live_trading}, transaction_client={self.transaction_client is not None}"
+        )
         if self.live_trading and self.transaction_client:
             print("[AUTH] Deriving L2 API credentials...")
             try:
-                api_creds = await self.transaction_client.derive_l2_api_credentials(
-                    self.order_signer
-                )
-                self.transaction_client.set_api_credentials(api_creds)
+                api_creds = await self.transaction_client.create_or_derive_api_creds()
+                self.transaction_client.set_api_creds(api_creds)
+                # api_creds = await self.transaction_client.derive_l2_api_credentials(
+                #     self.signer
+                # )
+                # self.transaction_client.set_api_credentials(api_creds)
                 print("[AUTH] ✓ API credentials configured")
             except Exception as e:
                 print(f"[AUTH ERROR] Failed to derive credentials: {e}")
                 import traceback
+
                 traceback.print_exc()
+
+        # Initialize simulation mode
+        if self.simulation_mode:
+            initial_balance = self.initial_balance_override
+
+            # If no override, try to fetch actual balance from API
+            if initial_balance is None and self.live_trading and self.transaction_client:
+                try:
+                    print("[SIMULATION] Fetching current balance from API...")
+                    from py_clob_client.clob_types import BalanceAllowanceParams
+                    balance_response = await self.transaction_client.get_balance_allowance(
+                        BalanceAllowanceParams(signature_type=self.config.clob.signature_type)
+                    )
+                    # Response typically has 'allowance' field in USDC (6 decimals)
+                    if isinstance(balance_response, dict) and 'allowance' in balance_response:
+                        initial_balance = float(balance_response['allowance']) / 1e6  # Convert from micro-USDC
+                        print(f"[SIMULATION] Using actual balance: ${initial_balance:.2f}")
+                    else:
+                        print(f"[SIMULATION] Unexpected balance response: {balance_response}")
+                        initial_balance = 1000.0  # Fallback
+                except Exception as e:
+                    print(f"[SIMULATION WARNING] Could not fetch balance: {e}")
+                    initial_balance = 1000.0  # Fallback
+
+            # Default to $1000 if still None
+            if initial_balance is None:
+                initial_balance = 1000.0
+
+            self.order_executor = SimulatedOrderExecutor(initial_balance=initial_balance)
+            print(f"[SIMULATION] Initialized with ${initial_balance:.2f} starting capital")
 
         self.refresh_markets()
 
@@ -895,8 +1195,10 @@ class TradingEngine:
             if self.live_trading and self.transaction_client:
                 try:
                     print("  Cancelling all pending orders...")
-                    await self.transaction_client.cancel_all_orders()
-                    await self.transaction_client.close()
+                    await self.transaction_client.cancel_all()
+                    # await self.transaction_client.cancel_all_orders()
+                    # await self.transaction_client.close()
+                    # await self.transaction_client.clo
                 except Exception as e:
                     print(f"  Error during order cleanup: {e}")
 
@@ -907,6 +1209,10 @@ class TradingEngine:
                 self.close_all_positions()
 
             self.print_final_stats()
+
+            # Print simulation statistics
+            if self.order_executor:
+                self.order_executor.print_statistics()
 
             # Save RL model if training
             if isinstance(self.strategy, MLStrategy) and self.strategy.training:
