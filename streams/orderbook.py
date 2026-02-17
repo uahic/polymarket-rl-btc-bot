@@ -55,7 +55,6 @@ class OrderbookStreamer:
         self._subscriptions: List[tuple] = []  # [(condition_id, token_id, side), ...]
         self._pending_subs: List[str] = []  # New token IDs to subscribe
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._force_reconnect = False  # Flag to trigger reconnection
         self._active_condition_ids: set = set()  # Track currently active markets
 
     def subscribe(self, condition_id: str, token_up: str, token_down: str):
@@ -111,10 +110,8 @@ class OrderbookStreamer:
         # Update the tracked active markets
         self._active_condition_ids = active_condition_ids.copy()
 
-        # Only reconnect if we actually removed stale subscriptions
-        if had_stale and len(self._subscriptions) < old_sub_count:
-            logger.info(f"  [OB] Cleared {len(stale_keys)} stale orderbooks, triggering reconnect")
-            self._force_reconnect = True
+        if had_stale:
+            logger.info(f"  [OB] Cleared {len(stale_keys)} stale orderbooks")
 
     def on_update(self, callback: Callable):
         """Register a callback for orderbook updates."""
@@ -207,12 +204,6 @@ class OrderbookStreamer:
                     # Listen for updates
                     while self.running:
                         try:
-                            # Check for forced reconnection (markets changed)
-                            if self._force_reconnect:
-                                logger.info("[OB] Force reconnect triggered, closing connection...")
-                                self._force_reconnect = False
-                                break  # Exit inner loop to reconnect
-
                             # Check for pending subscriptions FIRST (new markets added dynamically)
                             if self._pending_subs:
                                 new_tokens = self._pending_subs.copy()
@@ -291,11 +282,6 @@ class OrderbookStreamer:
                 if ob.token_id == asset_id:
                     ob.last_update = datetime.now(timezone.utc)
                     break
-
-    def reconnect(self):
-        """Force a reconnection to pick up new subscriptions cleanly."""
-        logger.info("[OB] Manual reconnect requested")
-        self._force_reconnect = True
 
     def stop(self):
         """Stop streaming."""

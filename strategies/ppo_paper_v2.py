@@ -237,10 +237,14 @@ class PPOStrategyV2(MLStrategy):
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
         # Experience buffer
-        self.experiences: List[Experience] = []
+        self.experiences: deque = deque(maxlen=self.buffer_size)
 
         # Temporal state history (single buffer for this strategy instance)
         self._state_history: deque = deque(maxlen=self.history_len)
+
+        # Preallocated numpy buffer for temporal state construction — avoids per-step heap alloc
+        # Shape: (history_len, input_dim). Written in-place; returned as a flat copy.
+        self._temporal_buf = np.zeros((self.history_len, self.input_dim), dtype=np.float32)
 
         # Fixed reward scaling (not adaptive normalization)
         # Scale PnL to roughly [-1, 1] range for stability
@@ -255,10 +259,14 @@ class PPOStrategyV2(MLStrategy):
         # Track previous action (initialize to HOLD=1)
         self._previous_action: int = 1
 
-        # Set device
+        # Networks reside on CPU by default for low-latency per-step inference.
+        # update() moves them to self.device (GPU if available) for batch training,
+        # then moves them back to CPU when done.
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.actor.to(self.device)
-        self.critic.to(self.device)
+        self.cpu_device = torch.device('cpu')
+        # Keep on CPU initially — update() will handle GPU transfer when training
+        self.actor.to(self.cpu_device)
+        self.critic.to(self.cpu_device)
 
 
     def _append_previous_action(self, features: np.ndarray) -> np.ndarray:
@@ -284,22 +292,25 @@ class PPOStrategyV2(MLStrategy):
         Returns flattened array of shape (history_len * input_dim,) which the
         GRU TemporalEncoder reshapes internally to (batch, history_len, input_dim).
 
+        Uses a preallocated buffer to avoid per-step heap allocation.
+
         Args:
             current_features_with_action: 29-dim features (26 base + 3 prev action)
         """
         # Add current state to history
         self._state_history.append(current_features_with_action.copy())
 
-        # Pad with zeros if not enough history
-        if len(self._state_history) < self.history_len:
-            padding = [np.zeros(self.input_dim, dtype=np.float32)] * (
-                self.history_len - len(self._state_history)
-            )
-            stacked = np.concatenate(padding + list(self._state_history))
+        n = len(self._state_history)
+        pad = self.history_len - n
+        if pad > 0:
+            self._temporal_buf[:pad] = 0.0
+            for i, s in enumerate(self._state_history):
+                self._temporal_buf[pad + i] = s
         else:
-            stacked = np.concatenate(list(self._state_history))
+            for i, s in enumerate(self._state_history):
+                self._temporal_buf[i] = s
 
-        return stacked.astype(np.float32)
+        return self._temporal_buf.flatten()
 
     def act(self, features: np.ndarray) -> Action:
         """Select action using current policy with temporal context.
@@ -316,17 +327,16 @@ class PPOStrategyV2(MLStrategy):
         # Get temporal state (stacked history of 29-dim states)
         temporal_state = self._get_temporal_state(features_with_action)
 
-        # Convert to PyTorch tensors
-        features_tensor = torch.tensor(features_with_action.reshape(1, -1), dtype=torch.float32, device=self.device)
-        temporal_tensor = torch.tensor(temporal_state.reshape(1, -1), dtype=torch.float32, device=self.device)
+        # Inference on CPU — networks reside on CPU between training updates
+        features_tensor = torch.tensor(features_with_action.reshape(1, -1), dtype=torch.float32)
+        temporal_tensor = torch.tensor(temporal_state.reshape(1, -1), dtype=torch.float32)
 
-        # Get action probabilities and value with temporal context
         with torch.no_grad():
             probs = self.actor(features_tensor, temporal_tensor)
             value = self.critic(features_tensor, temporal_tensor)
 
-        probs_np = probs[0].cpu().numpy()
-        value_np = float(value[0, 0].cpu().numpy())
+        probs_np = probs[0].numpy()
+        value_np = float(value[0, 0].item())
 
         if self.training:
             # Sample from distribution
@@ -363,9 +373,9 @@ class PPOStrategyV2(MLStrategy):
             next_features: Next state features (26-dim: 22 market + 4 time-of-day)
             done: Whether episode ended
         """
-        # Apply fixed scaling to reward (not adaptive normalization)
-        # This keeps rewards in a stable range without moving targets
-        scaled_reward = reward * self.reward_scale
+        # Reward arrives already clipped to [-3, 3] (or raw -2.0 for redundant actions)
+        # by the gym. No further scaling needed.
+        scaled_reward = reward
 
         # Use the state that act() actually saw — cached before _previous_action was updated.
         # Recomputing here would use the post-update _previous_action and produce the wrong state.
@@ -384,15 +394,20 @@ class PPOStrategyV2(MLStrategy):
         # Compute next temporal state by peeking at history without mutating it.
         # _get_temporal_state() appends to _state_history; calling it here would corrupt the
         # sequence that act() relies on (it would interleave act-states with store-states).
-        history_list = list(self._state_history)  # current history after act() appended to it
-        history_list.append(next_features_with_action)  # peek: what history looks like at t+1
-        if len(history_list) < self.history_len:
-            padding = [np.zeros(self.input_dim, dtype=np.float32)] * (
-                self.history_len - len(history_list)
-            )
-            next_temporal_state = np.concatenate(padding + history_list).astype(np.float32)
+        # Build into a temporary buffer to avoid heap allocation.
+        peek_buf = np.empty((self.history_len, self.input_dim), dtype=np.float32)
+        history_snapshot = list(self._state_history)  # shallow copy of deque references
+        history_snapshot.append(next_features_with_action)
+        n = len(history_snapshot)
+        pad = self.history_len - n
+        if pad > 0:
+            peek_buf[:pad] = 0.0
+            for i, s in enumerate(history_snapshot):
+                peek_buf[pad + i] = s
         else:
-            next_temporal_state = np.concatenate(history_list[-self.history_len :]).astype(np.float32)
+            for i, s in enumerate(history_snapshot[-self.history_len:]):
+                peek_buf[i] = s
+        next_temporal_state = peek_buf.flatten()
 
         exp = Experience(
             state=features_with_action,
@@ -411,10 +426,6 @@ class PPOStrategyV2(MLStrategy):
         )
         self.experiences.append(exp)
 
-        # Limit buffer size
-        if len(self.experiences) > self.buffer_size:
-            self.experiences = self.experiences[-self.buffer_size :]
-
     def _compute_gae(
         self,
         rewards: np.ndarray,
@@ -424,8 +435,8 @@ class PPOStrategyV2(MLStrategy):
     ) -> tuple:
         """Compute Generalized Advantage Estimation."""
         n = len(rewards)
-        advantages = np.zeros(n)
-        returns = np.zeros(n)
+        advantages = np.zeros(n, dtype=np.float32)
+        returns = np.zeros(n, dtype=np.float32)
 
         gae = 0
         for t in reversed(range(n)):
@@ -457,6 +468,10 @@ class PPOStrategyV2(MLStrategy):
         if len(self.experiences) < self.buffer_size:
             return None
 
+        # Move networks to training device (GPU if available) for batch training
+        self.actor.to(self.device)
+        self.critic.to(self.device)
+
         # Print training indicator
         # print(f"\n{'='*60}")
         # print(f"  PPO TRAINING UPDATE")
@@ -485,21 +500,35 @@ class PPOStrategyV2(MLStrategy):
             self.experiences[-1].next_temporal_state.reshape(1, -1), dtype=torch.float32, device=self.device
         )
         with torch.no_grad():
-            next_value = float(self.critic(next_state_tensor, next_temporal_tensor)[0, 0].cpu().numpy())
+            next_value = self.critic(next_state_tensor, next_temporal_tensor)[0, 0].item()
 
         # Compute advantages and returns
         advantages, returns = self._compute_gae(rewards, old_values, dones, next_value)
+        del rewards, dones
 
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Convert to PyTorch tensors (including temporal states)
+        # Compute explained variance before converting to tensors (needs numpy arrays)
+        var_y = np.var(returns)
+        explained_var = (
+            1 - np.var(returns - old_values) / (var_y + 1e-8) if var_y > 0 else 0.0
+        )
+
+        # Convert to PyTorch tensors (including temporal states); del numpy arrays immediately
+        # to avoid holding both the numpy source and the tensor copy in memory simultaneously.
         states_tensor = torch.tensor(states, dtype=torch.float32, device=self.device)
+        del states
         temporal_states_tensor = torch.tensor(temporal_states, dtype=torch.float32, device=self.device)
+        del temporal_states
         actions_tensor = torch.tensor(actions, dtype=torch.long, device=self.device)
+        del actions
         old_log_probs_tensor = torch.tensor(old_log_probs, dtype=torch.float32, device=self.device)
-        advantages_tensor = torch.tensor(advantages.astype(np.float32), dtype=torch.float32, device=self.device)
-        returns_tensor = torch.tensor(returns.astype(np.float32), dtype=torch.float32, device=self.device)
+        del old_log_probs
+        advantages_tensor = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+        del advantages
+        returns_tensor = torch.tensor(returns, dtype=torch.float32, device=self.device)
+        del returns, old_values
 
         n_samples = len(self.experiences)
         all_metrics = {
@@ -580,14 +609,14 @@ class PPOStrategyV2(MLStrategy):
                 self._clip_grad_norm(self.critic, self.max_grad_norm)
                 self.critic_optimizer.step()
 
-                # Record metrics
-                all_metrics["policy_loss"].append(float(actor_loss.detach().cpu().numpy()))
-                all_metrics["value_loss"].append(float(critic_loss.detach().cpu().numpy()))
-                all_metrics["entropy"].append(float(entropy_mean.detach().cpu().numpy()))
-                all_metrics["approx_kl"].append(float(approx_kl.detach().cpu().numpy()))
-                all_metrics["clip_fraction"].append(float(clip_frac.detach().cpu().numpy()))
+                # Record metrics — .item() extracts scalar without extra host transfer
+                all_metrics["policy_loss"].append(actor_loss.item())
+                all_metrics["value_loss"].append(critic_loss.item())
+                all_metrics["entropy"].append(entropy_mean.item())
+                all_metrics["approx_kl"].append(approx_kl.item())
+                all_metrics["clip_fraction"].append(clip_frac.item())
 
-                epoch_kl += float(approx_kl.detach().cpu().numpy())
+                epoch_kl += approx_kl.item()
                 n_batches += 1
 
             # Early stopping on KL divergence
@@ -599,14 +628,11 @@ class PPOStrategyV2(MLStrategy):
         # Clear buffer after update
         self.experiences.clear()
 
-        # Compute explained variance
-        y_pred = old_values
-        y_true = returns
-        var_y = np.var(y_true)
-        explained_var = (
-            1 - np.var(y_true - y_pred) / (var_y + 1e-8) if var_y > 0 else 0.0
-        )
-
+        # Move networks back to CPU for low-latency per-step inference
+        self.actor.to(self.cpu_device)
+        self.critic.to(self.cpu_device)
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         # Prepare return metrics
         metrics = {
@@ -635,6 +661,7 @@ class PPOStrategyV2(MLStrategy):
         """Clear experience buffer and state history for new episode."""
         self.experiences.clear()
         self._state_history.clear()
+        self._temporal_buf[:] = 0.0
         self._last_temporal_state = None
         self._last_features_with_action = None
         self._last_log_prob = 0.0
@@ -681,10 +708,9 @@ class PPOStrategyV2(MLStrategy):
         # Load reward scaling
         self.reward_scale = float(checkpoint.get('reward_scale', 0.1))
 
-        # Move to device and restore train mode (load_state_dict preserves the saved
-        # training flag, which may differ from our intended mode)
-        self.actor.to(self.device)
-        self.critic.to(self.device)
+        # Keep on CPU for low-latency per-step inference; update() handles GPU transfer
+        self.actor.to(self.cpu_device)
+        self.critic.to(self.cpu_device)
         if self.training:
             self.actor.train()
             self.critic.train()

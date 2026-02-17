@@ -175,17 +175,20 @@ class GymTradingRunner:
             # Discover active markets
             markets = await self._discover_markets()
 
-            # Clean up stale orderbook subscriptions for expired markets
-            active_condition_ids = {market.condition_id for market in markets}
-            self.orderbook_streamer.clear_stale(active_condition_ids)
-
-            # Subscribe to orderbook streams for discovered markets
+            # Subscribe to orderbook streams for discovered markets first,
+            # then clean up stale subscriptions. This order ensures the current
+            # market's condition_id is already in the active set before stale
+            # cleanup runs, preventing a spurious reconnect at episode boundaries.
             for market in markets:
                 self.orderbook_streamer.subscribe(
                     market.condition_id,
                     market.token_up,
                     market.token_down
                 )
+
+            # Clean up stale orderbook subscriptions for expired markets
+            active_condition_ids = {market.condition_id for market in markets}
+            self.orderbook_streamer.clear_stale(active_condition_ids)
 
             for market in markets:
                 asset = market.asset
@@ -259,7 +262,7 @@ class GymTradingRunner:
             action = strategy.act(obs)
 
             # Step environment
-            next_obs, reward, done, truncated, info = env.step(action)
+            next_obs, reward, done, truncated, info = await env.step(action)
 
             # RL training (if enabled)
             if hasattr(strategy, 'store') and hasattr(strategy, 'training') and strategy.training:

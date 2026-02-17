@@ -7,7 +7,7 @@ Provides: funding rate, open interest, liquidations, mark price.
 import asyncio
 import logging
 import json
-import requests
+import aiohttp
 import websockets
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -42,20 +42,20 @@ class FuturesState:
     # Open Interest
     open_interest: float = 0.0  # Current OI in contracts
     open_interest_value: float = 0.0  # OI in USDT
-    oi_history: List[float] = field(default_factory=list)  # For OI change calc
+    oi_history: deque = field(default_factory=lambda: deque(maxlen=60))  # For OI change calc (~1hr)
 
     # Trade flow (CVD proxy)
     buy_volume: float = 0.0
     sell_volume: float = 0.0
     cvd: float = 0.0  # Cumulative volume delta
-    cvd_history: List[float] = field(default_factory=list)  # For CVD acceleration calc
+    cvd_history: deque = field(default_factory=lambda: deque(maxlen=60))  # For CVD acceleration calc (~1hr)
     trade_count: int = 0
 
     # Trade intensity tracking (for 15-min features)
-    trade_timestamps: List[float] = field(default_factory=list)  # Recent trade times
+    trade_timestamps: deque = field(default_factory=deque)  # Recent trade times (variable window, use popleft)
     large_trade_threshold: float = 0.0  # Dynamic threshold based on recent trades
     large_trade_flag: float = 0.0  # 1.0 if large trade just hit, decays
-    recent_trade_sizes: List[float] = field(default_factory=list)  # For threshold calc
+    recent_trade_sizes: deque = field(default_factory=lambda: deque(maxlen=100))  # For threshold calc
 
     # Liquidations
     recent_long_liqs: float = 0.0  # Long liquidation volume (last hour)
@@ -71,7 +71,7 @@ class FuturesState:
     # Volatility
     realized_vol_1h: float = 0.0  # Rolling 1h volatility
     realized_vol_5m: float = 0.0  # Rolling 5m volatility
-    returns_history: List[float] = field(default_factory=list)  # Recent 1m returns for vol calc
+    returns_history: deque = field(default_factory=lambda: deque(maxlen=5))  # Recent 1m returns for vol calc
 
     # Volume
     volume_24h: float = 0.0
@@ -121,62 +121,67 @@ class FuturesState:
         """Trades per second over last 10 seconds."""
         import time
         now = time.time()
-        # Count trades in last 10 seconds
-        recent = [t for t in self.trade_timestamps if now - t < 10]
-        return len(recent) / 10.0
+        cutoff = now - 10
+        # Deque is time-ordered; count from right until we exceed the window
+        count = 0
+        for t in reversed(self.trade_timestamps):
+            if t < cutoff:
+                break
+            count += 1
+        return count / 10.0
 
 
-def fetch_funding_rate(asset: str) -> Optional[Dict]:
-    """Fetch current funding rate and mark price."""
+async def fetch_funding_rate(session: aiohttp.ClientSession, asset: str) -> Optional[Dict]:
+    """Fetch current funding rate and mark price (async)."""
     symbol = FUTURES_SYMBOLS.get(asset)
     if not symbol:
         return None
 
     try:
         url = f"{BINANCE_FUTURES_API}/fapi/v1/premiumIndex?symbol={symbol}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            return {
-                "funding_rate": float(data["lastFundingRate"]),
-                "mark_price": float(data["markPrice"]),
-                "index_price": float(data["indexPrice"]),
-            }
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return {
+                    "funding_rate": float(data["lastFundingRate"]),
+                    "mark_price": float(data["markPrice"]),
+                    "index_price": float(data["indexPrice"]),
+                }
     except Exception as e:
         logger.error(f"Error fetching funding rate for {asset}: {e}")
     return None
 
 
-def fetch_open_interest(asset: str) -> Optional[Dict]:
-    """Fetch current open interest."""
+async def fetch_open_interest(session: aiohttp.ClientSession, asset: str) -> Optional[Dict]:
+    """Fetch current open interest (async)."""
     symbol = FUTURES_SYMBOLS.get(asset)
     if not symbol:
         return None
 
     try:
         url = f"{BINANCE_FUTURES_API}/fapi/v1/openInterest?symbol={symbol}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            return {
-                "open_interest": float(data["openInterest"]),
-            }
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return {
+                    "open_interest": float(data["openInterest"]),
+                }
     except Exception as e:
         logger.error(f"Error fetching OI for {asset}: {e}")
     return None
 
 
-def fetch_klines(asset: str, interval: str = "1m", limit: int = 60) -> Optional[List]:
-    """Fetch recent klines for price/volume data."""
+async def fetch_klines(session: aiohttp.ClientSession, asset: str, interval: str = "1m", limit: int = 60) -> Optional[List]:
+    """Fetch recent klines for price/volume data (async)."""
     symbol = FUTURES_SYMBOLS.get(asset)
     if not symbol:
         return None
 
     try:
         url = f"{BINANCE_FUTURES_API}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            return resp.json()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                return await resp.json()
     except Exception as e:
         logger.error(f"Error fetching klines for {asset}: {e}")
     return None
@@ -300,7 +305,7 @@ class FuturesStreamer:
             "returns_5m": state.returns_5m,
             "returns_10m": state.returns_10m,
             "cvd": state.cvd,
-            "cvd_history": state.cvd_history,
+            "cvd_history": list(state.cvd_history),
             "trade_flow_imbalance": trade_flow_imbalance,
             "trade_intensity": state.trade_count / 60.0,  # Trades per second
             "large_trade_flag": state.large_trade_flag,
@@ -311,58 +316,57 @@ class FuturesStreamer:
         }
 
     async def _poll_rest_data(self):
-        """Periodically fetch REST data (funding, OI, klines)."""
-        while self.running:
-            for asset in self.assets:
-                state = self.states.get(asset)
-                if not state:
-                    continue
+        """Periodically fetch REST data (funding, OI, klines) — non-blocking via aiohttp."""
+        async with aiohttp.ClientSession() as session:
+            while self.running:
+                for asset in self.assets:
+                    state = self.states.get(asset)
+                    if not state:
+                        continue
 
-                # Funding rate
-                funding = fetch_funding_rate(asset)
-                if funding:
-                    state.funding_rate = funding["funding_rate"]
-                    state.mark_price = funding["mark_price"]
-                    state.index_price = funding["index_price"]
+                    # Fetch all three concurrently per asset
+                    funding, oi, klines = await asyncio.gather(
+                        fetch_funding_rate(session, asset),
+                        fetch_open_interest(session, asset),
+                        fetch_klines(session, asset, "1m", 65),
+                        return_exceptions=True,
+                    )
 
-                # Open interest
-                oi = fetch_open_interest(asset)
-                if oi:
-                    state.open_interest = oi["open_interest"]
-                    state.oi_history.append(oi["open_interest"])
-                    if len(state.oi_history) > 60:  # Keep ~1hr of history
-                        state.oi_history = state.oi_history[-60:]
+                    if isinstance(funding, dict):
+                        state.funding_rate = funding["funding_rate"]
+                        state.mark_price = funding["mark_price"]
+                        state.index_price = funding["index_price"]
 
-                # Klines for multi-TF returns and volume (fetch 65 for 1h returns)
-                klines = fetch_klines(asset, "1m", 65)
-                if klines:
-                    returns = compute_multi_tf_returns(klines)
-                    state.returns_1m = returns["1m"]
-                    state.returns_5m = returns["5m"]
-                    state.returns_10m = returns["10m"]
-                    state.returns_15m = returns["15m"]
-                    state.returns_1h = returns["1h"]
-                    state.realized_vol_1h = returns["realized_vol_1h"]
+                    if isinstance(oi, dict):
+                        state.open_interest = oi["open_interest"]
+                        state.oi_history.append(oi["open_interest"])
 
-                    # Track recent returns for 5m volatility
-                    state.returns_history.append(state.returns_1m)
-                    if len(state.returns_history) > 5:  # Keep last 5 returns
-                        state.returns_history = state.returns_history[-5:]
+                    if isinstance(klines, list) and klines:
+                        returns = compute_multi_tf_returns(klines)
+                        state.returns_1m = returns["1m"]
+                        state.returns_5m = returns["5m"]
+                        state.returns_10m = returns["10m"]
+                        state.returns_15m = returns["15m"]
+                        state.returns_1h = returns["1h"]
+                        state.realized_vol_1h = returns["realized_vol_1h"]
 
-                    # Compute 5m realized volatility
-                    if len(state.returns_history) >= 5:
-                        state.realized_vol_5m = float(np.std(state.returns_history) * np.sqrt(5))  # Scale to 5min
-                    else:
-                        state.realized_vol_5m = state.realized_vol_1h  # Fallback
+                        # Track recent returns for 5m volatility
+                        state.returns_history.append(state.returns_1m)
 
-                    vol_stats = compute_volume_stats(klines)
-                    state.volume_1h = vol_stats["volume_1h"]
-                    state.volume_24h = vol_stats["volume_24h"]
+                        # Compute 5m realized volatility
+                        if len(state.returns_history) >= 5:
+                            state.realized_vol_5m = float(np.std(list(state.returns_history)) * np.sqrt(5))
+                        else:
+                            state.realized_vol_5m = state.realized_vol_1h  # Fallback
 
-                state.last_update = datetime.now(timezone.utc)
+                        vol_stats = compute_volume_stats(klines)
+                        state.volume_1h = vol_stats["volume_1h"]
+                        state.volume_24h = vol_stats["volume_24h"]
 
-            # Poll every 10 seconds
-            await asyncio.sleep(10)
+                    state.last_update = datetime.now(timezone.utc)
+
+                # Poll every 10 seconds
+                await asyncio.sleep(10)
 
     async def _stream_trades(self):
         """Stream aggregate trades for CVD calculation."""
@@ -372,7 +376,7 @@ class FuturesStreamer:
 
         while self.running:
             try:
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                     while self.running:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -399,22 +403,20 @@ class FuturesStreamer:
                                             state.cvd = state.buy_volume - state.sell_volume
                                             state.trade_count += 1
 
-                                            # Track trade timestamps for intensity
+                                            # Track trade timestamps — popleft stale entries (O(1) amortized)
                                             now = time.time()
                                             state.trade_timestamps.append(now)
-                                            # Keep only last 30 seconds of timestamps
-                                            state.trade_timestamps = [t for t in state.trade_timestamps if now - t < 30]
+                                            cutoff = now - 30
+                                            while state.trade_timestamps and state.trade_timestamps[0] < cutoff:
+                                                state.trade_timestamps.popleft()
 
-                                            # Track trade sizes for large trade detection
+                                            # Track trade sizes — deque(maxlen=100) auto-evicts
                                             state.recent_trade_sizes.append(trade_value)
-                                            if len(state.recent_trade_sizes) > 100:
-                                                state.recent_trade_sizes = state.recent_trade_sizes[-100:]
 
-                                            # Update large trade threshold (2x median of recent trades)
+                                            # Update large trade threshold (3x median of recent trades)
                                             if len(state.recent_trade_sizes) >= 20:
-                                                import numpy as np
-                                                median_size = np.median(state.recent_trade_sizes)
-                                                state.large_trade_threshold = median_size * 3  # 3x median = large
+                                                median_size = np.median(list(state.recent_trade_sizes))
+                                                state.large_trade_threshold = median_size * 3
 
                                             # Detect large trade
                                             if state.large_trade_threshold > 0 and trade_value > state.large_trade_threshold:
@@ -436,7 +438,7 @@ class FuturesStreamer:
 
         while self.running:
             try:
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                     while self.running:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -498,10 +500,8 @@ class FuturesStreamer:
                     state.recent_short_liqs *= 0.9
                     state.cvd = state.buy_volume - state.sell_volume
 
-                    # Track CVD history for acceleration calculation
+                    # Track CVD history for acceleration calculation — deque auto-evicts
                     state.cvd_history.append(state.cvd)
-                    if len(state.cvd_history) > 60:  # Keep ~1hr of history
-                        state.cvd_history = state.cvd_history[-60:]
 
     async def stream(self):
         """Start all futures data streams."""
@@ -509,15 +509,16 @@ class FuturesStreamer:
 
         logger.info("Starting Binance Futures streams...")
 
-        # Initial data fetch
-        for asset in self.assets:
-            state = self.states.get(asset)
-            if state:
-                funding = fetch_funding_rate(asset)
-                if funding:
-                    state.funding_rate = funding["funding_rate"]
-                    state.mark_price = funding["mark_price"]
-                    logger.info(f"  {asset}: funding={state.funding_rate:.4%}, mark=${state.mark_price:,.2f}")
+        # Initial data fetch (async)
+        async with aiohttp.ClientSession() as session:
+            for asset in self.assets:
+                state = self.states.get(asset)
+                if state:
+                    funding = await fetch_funding_rate(session, asset)
+                    if funding:
+                        state.funding_rate = funding["funding_rate"]
+                        state.mark_price = funding["mark_price"]
+                        logger.info(f"  {asset}: funding={state.funding_rate:.4%}, mark=${state.mark_price:,.2f}")
 
         # Run all streams concurrently
         await asyncio.gather(
@@ -532,25 +533,79 @@ class FuturesStreamer:
         self.running = False
 
 
-# Quick fetch functions for one-shot data
+# Quick fetch functions for one-shot data (sync wrappers for standalone use)
+def _fetch_funding_rate_sync(asset: str) -> Optional[Dict]:
+    """Fetch current funding rate and mark price (sync, for standalone use)."""
+    import requests
+    symbol = FUTURES_SYMBOLS.get(asset)
+    if not symbol:
+        return None
+    try:
+        url = f"{BINANCE_FUTURES_API}/fapi/v1/premiumIndex?symbol={symbol}"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                "funding_rate": float(data["lastFundingRate"]),
+                "mark_price": float(data["markPrice"]),
+                "index_price": float(data["indexPrice"]),
+            }
+    except Exception as e:
+        logger.error(f"Error fetching funding rate for {asset}: {e}")
+    return None
+
+
+def _fetch_open_interest_sync(asset: str) -> Optional[Dict]:
+    """Fetch current open interest (sync, for standalone use)."""
+    import requests
+    symbol = FUTURES_SYMBOLS.get(asset)
+    if not symbol:
+        return None
+    try:
+        url = f"{BINANCE_FUTURES_API}/fapi/v1/openInterest?symbol={symbol}"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            return {"open_interest": float(data["openInterest"])}
+    except Exception as e:
+        logger.error(f"Error fetching OI for {asset}: {e}")
+    return None
+
+
+def _fetch_klines_sync(asset: str, interval: str = "1m", limit: int = 60) -> Optional[List]:
+    """Fetch recent klines (sync, for standalone use)."""
+    import requests
+    symbol = FUTURES_SYMBOLS.get(asset)
+    if not symbol:
+        return None
+    try:
+        url = f"{BINANCE_FUTURES_API}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        logger.error(f"Error fetching klines for {asset}: {e}")
+    return None
+
+
 def get_futures_snapshot(asset: str) -> Optional[FuturesState]:
     """Get a snapshot of futures data for an asset (non-streaming)."""
     state = FuturesState(asset=asset)
 
     # Funding
-    funding = fetch_funding_rate(asset)
+    funding = _fetch_funding_rate_sync(asset)
     if funding:
         state.funding_rate = funding["funding_rate"]
         state.mark_price = funding["mark_price"]
         state.index_price = funding["index_price"]
 
     # OI
-    oi = fetch_open_interest(asset)
+    oi = _fetch_open_interest_sync(asset)
     if oi:
         state.open_interest = oi["open_interest"]
 
     # Klines
-    klines = fetch_klines(asset, "1m", 65)
+    klines = _fetch_klines_sync(asset, "1m", 65)
     if klines:
         returns = compute_multi_tf_returns(klines)
         state.returns_1m = returns["1m"]

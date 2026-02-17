@@ -130,7 +130,7 @@ class GymExecutorWrapper(OrderExecutor):
                     filled=False,
                     balance=self.executor.get_balance(),
                     position=self.current_position,
-                    pnl=-0.5,  # Penalty for redundant action
+                    pnl=-2.0,  # Penalty for redundant action
                     fee=0.0,
                     slippage=0.0,
                     amount_spent=0.0,

@@ -136,6 +136,9 @@ class FeatureComputer:
         self.failures_scale = 5.0  # Max expected failures
         self.balance_scale = 1000.0  # Typical bankroll
 
+        # Preallocated output buffer — avoids heap allocation on every compute_features() call
+        self._feature_buf = np.zeros(26, dtype=np.float32)
+
     def compute_features(
         self,
         raw_data: RawMarketData,
@@ -187,53 +190,44 @@ class FeatureComputer:
         dow_sin  = math.sin(2 * math.pi * dow / 7)
         dow_cos  = math.cos(2 * math.pi * dow / 7)
 
-        features = np.array([
-            # 1-3: Ultra-short momentum
-            clamp(raw_data.futures.returns_1m * self.returns_scale),
-            clamp(raw_data.futures.returns_5m * self.returns_scale),
-            clamp(raw_data.futures.returns_10m * self.returns_scale),
+        f = self._feature_buf
+        # 1-3: Ultra-short momentum
+        f[0] = clamp(raw_data.futures.returns_1m * self.returns_scale)
+        f[1] = clamp(raw_data.futures.returns_5m * self.returns_scale)
+        f[2] = clamp(raw_data.futures.returns_10m * self.returns_scale)
+        # 4-7: Order flow
+        f[3] = clamp(ob_imbalance_l1)
+        f[4] = clamp(ob_imbalance_l5)
+        f[5] = clamp(raw_data.futures.trade_flow_imbalance)
+        f[6] = clamp(self._compute_cvd_acceleration(raw_data.futures.cvd_history) * self.cvd_accel_scale)
+        # 8-10: Microstructure
+        f[7] = clamp(spread_pct * self.spread_scale)
+        f[8] = clamp(raw_data.futures.trade_intensity / self.trade_intensity_scale)
+        f[9] = raw_data.futures.large_trade_flag
+        # 11-12: Volatility
+        f[10] = clamp(vol_5m * self.vol_scale)
+        f[11] = clamp(raw_data.futures.avg_vol / max(0.001, raw_data.futures.realized_vol_5m))
+        # 13-16: Position
+        f[12] = float(position.has_position)
+        f[13] = 1.0 if position.side == "UP" else (-1.0 if position.side == "DOWN" else 0.0)
+        f[14] = clamp(position.unrealized_pnl / self.pnl_scale)
+        f[15] = position.time_remaining_normalized
+        # 17-18: Regime
+        f[16] = raw_data.vol_regime
+        f[17] = raw_data.trend_regime
+        # 19-21: Transaction status
+        f[18] = float(transaction.pending_order)
+        f[19] = float(transaction.failed_order)
+        f[20] = clamp(transaction.consecutive_failures / self.failures_scale)
+        # 22: Capital management
+        f[21] = clamp(capital.available_balance / self.balance_scale)
+        # 23-26: Time-of-day encoding
+        f[22] = hour_sin
+        f[23] = hour_cos
+        f[24] = dow_sin
+        f[25] = dow_cos
 
-            # 4-7: Order flow - THE EDGE
-            clamp(ob_imbalance_l1),
-            clamp(ob_imbalance_l5),
-            clamp(raw_data.futures.trade_flow_imbalance),
-            clamp(self._compute_cvd_acceleration(raw_data.futures.cvd_history) * self.cvd_accel_scale),
-
-            # 8-10: Microstructure
-            clamp(spread_pct * self.spread_scale),
-            clamp(raw_data.futures.trade_intensity / self.trade_intensity_scale),
-            raw_data.futures.large_trade_flag,  # Already 0 or 1
-
-            # 11-12: Volatility
-            clamp(vol_5m * self.vol_scale),
-            clamp(raw_data.futures.avg_vol / max(0.001, raw_data.futures.realized_vol_5m)),  # Vol expansion
-
-            # 13-16: Position
-            float(position.has_position),
-            1.0 if position.side == "UP" else (-1.0 if position.side == "DOWN" else 0.0),
-            clamp(position.unrealized_pnl / self.pnl_scale),
-            position.time_remaining_normalized,  # Already [0, 1]
-
-            # 17-18: Regime
-            raw_data.vol_regime,
-            raw_data.trend_regime,
-
-            # 19-21: Transaction status
-            float(transaction.pending_order),
-            float(transaction.failed_order),
-            clamp(transaction.consecutive_failures / self.failures_scale),
-
-            # 22: Capital management
-            clamp(capital.available_balance / self.balance_scale),
-
-            # 23-26: Time-of-day encoding (cyclical, always in [-1, 1])
-            hour_sin,
-            hour_cos,
-            dow_sin,
-            dow_cos,
-        ], dtype=np.float32)
-
-        return features
+        return f.copy()
 
     def _compute_orderbook_imbalance_l1(self, orderbook: OrderbookSnapshot) -> float:
         """

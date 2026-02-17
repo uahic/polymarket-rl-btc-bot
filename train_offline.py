@@ -43,6 +43,7 @@ See --help for all available options.
 """
 
 import argparse
+import asyncio
 import logging
 import torch
 import numpy as np
@@ -94,7 +95,7 @@ def load_training_state(output_path: str) -> Optional[Dict]:
     return None
 
 
-def train_offline(
+async def train_offline(
     strategy: Any,
     data_dir: str,
     assets: List[str],
@@ -210,7 +211,7 @@ def train_offline(
             action_int = action.value if hasattr(action, 'value') else action
 
             # Step environment
-            next_obs, reward, done, truncated, info = env.step(action)
+            next_obs, reward, done, truncated, info = await env.step(action)
 
             # Store experience (use int for PPO)
             strategy.store(obs, action_int, reward, next_obs, done or truncated)
@@ -277,7 +278,7 @@ def train_offline(
     logger.info(f"Next steps: Evaluate model, deploy to paper trading, monitor performance. To resume: python train_offline.py --resume-from {output_path}")
 
 
-def main():
+async def main():
     """Main entry point for offline training."""
     parser = argparse.ArgumentParser(
         description="Train RL agent on historical market data",
@@ -451,7 +452,7 @@ def main():
     )
 
     # Start training
-    train_offline(
+    await train_offline(
         strategy=strategy,
         data_dir=args.data_dir,
         assets=args.assets,
@@ -463,4 +464,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

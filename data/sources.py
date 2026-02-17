@@ -9,11 +9,13 @@ Both sources produce the same RawMarketData format, ensuring
 identical preprocessing for training and deployment.
 """
 
+import asyncio
 import logging
 import sys
 import time
 import random
 
+from collections import deque
 from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict
@@ -67,7 +69,7 @@ class DataSource(ABC):
         pass
 
     @abstractmethod
-    def advance(self) -> bool:
+    async def advance(self) -> bool:
         """
         Advance to next time step.
 
@@ -167,7 +169,7 @@ class HistoricalSource(DataSource):
 
         return self.current_episode[self.current_idx]
 
-    def advance(self) -> bool:
+    async def advance(self) -> bool:
         """
         Advance to next tick.
 
@@ -313,7 +315,7 @@ class HistoricalSource(DataSource):
         # Each 1-min bar = 120 ticks at 500ms
         # For 15 bars = 1800 ticks total
         episode = []
-        prob_history = []
+        prob_history: deque = deque(maxlen=50)
 
         # Pre-index Polymarket data by timestamp for faster lookup
         polymarket_lookup = {}
@@ -395,11 +397,7 @@ class HistoricalSource(DataSource):
                 )
 
                 episode.append(raw_data)
-                prob_history.append(prob_up)
-
-                # Keep history bounded
-                if len(prob_history) > 50:
-                    prob_history = prob_history[-50:]
+                prob_history.append(prob_up)  # deque(maxlen=50) auto-evicts oldest
 
                 # Stop if we've generated enough ticks
                 if len(episode) >= self.episode_length:
@@ -441,17 +439,13 @@ class HistoricalSource(DataSource):
         logger.info(f"[HistoricalSource] Generating dummy episode for {asset}")
 
         episode = []
-        prob_history = []
+        prob_history: deque = deque(maxlen=50)
 
         for tick in range(self.episode_length):
             # Simulate some market dynamics
             t = tick * 0.5  # 500ms per tick
             prob = 0.5 + 0.1 * np.sin(t / 100)  # Oscillating probability
-            prob_history.append(prob)
-
-            # Keep only last 50 ticks
-            if len(prob_history) > 50:
-                prob_history = prob_history[-50:]
+            prob_history.append(prob)  # deque(maxlen=50) auto-evicts oldest
 
             raw_data = RawMarketData(
                 timestamp=time.time() + tick * 0.5,
@@ -535,7 +529,7 @@ class LiveSource(DataSource):
         self.episode_duration = 900.0  # 15 minutes
 
         # History tracking
-        self.prob_history: List[float] = []
+        self.prob_history: deque = deque(maxlen=50)
 
     def reset(self, asset: str, market_id: str) -> RawMarketData:
         """
@@ -550,13 +544,9 @@ class LiveSource(DataSource):
         """
         self.current_asset = asset
         self.current_market = market_id
-        self.prob_history = []
+        self.prob_history = deque(maxlen=50)
 
-        # Wait for streams to have data
-        logger.info(f"[LiveSource] Waiting for stream data for {asset}...")
-        time.sleep(1.0)
-
-        # Start episode timer after waiting for stream data
+        # Start episode timer
         self.episode_start_time = time.time()
 
         return self.get_current()
@@ -617,10 +607,8 @@ class LiveSource(DataSource):
         # Current probability (from orderbook mid price), clamped to valid range
         prob_up = max(0.0, min(1.0, orderbook.mid_price))
 
-        # Update history
+        # Update history — deque(maxlen=50) auto-evicts oldest
         self.prob_history.append(prob_up)
-        if len(self.prob_history) > 50:
-            self.prob_history = self.prob_history[-50:]
 
         return RawMarketData(
             timestamp=timestamp,
@@ -635,7 +623,7 @@ class LiveSource(DataSource):
             trend_regime=futures_data.get("trend_regime", 0.0),
         )
 
-    def advance(self) -> bool:
+    async def advance(self) -> bool:
         """
         Wait for next tick (500ms).
 
@@ -644,7 +632,7 @@ class LiveSource(DataSource):
         Returns:
             True (always has more data unless market expires)
         """
-        time.sleep(self.tick_interval)
+        await asyncio.sleep(self.tick_interval)
         return not self.is_done()
 
     def is_done(self) -> bool:

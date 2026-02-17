@@ -175,11 +175,6 @@ class TradingGym(gym.Env):
         self.current_market_data: Optional[RawMarketData] = None
         self.pending_rewards: Dict[str, float] = {}  # For terminal rewards
 
-        # Reward normalization
-        self.reward_mean = 0.0
-        self.reward_std = 1.0
-        self.reward_count = 0
-
         # Episode metrics
         self.episode_pnl = 0.0
         self.episode_fees = 0.0
@@ -228,7 +223,7 @@ class TradingGym(gym.Env):
 
         return obs, info
 
-    def step(
+    async def step(
         self,
         action: Action,
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -259,7 +254,7 @@ class TradingGym(gym.Env):
         reward = self._compute_reward(result)
 
         # Advance time
-        has_more_data = self.data_source.advance()
+        has_more_data = await self.data_source.advance()
         self.step_count += 1
 
         # Check termination
@@ -349,12 +344,27 @@ class TradingGym(gym.Env):
         1. Terminal reward: Realized P&L when position closes (primary signal)
         2. Shaping reward: Unrealized P&L * coefficient (optional, helps with credit assignment)
 
+        Redundant-action penalties bypass normalization so they always register
+        as a strong fixed negative, preventing the z-score mean from absorbing them.
+        All other rewards are clipped to [-3, 3] instead of z-scored, which keeps
+        the scale stable without shifting the penalty signal.
+
         Args:
             result: Execution result
 
         Returns:
             Scalar reward
         """
+        # Redundant action: return the raw penalty directly, skip normalization.
+        # This guarantees the gradient signal is always a hard negative regardless
+        # of running reward statistics.
+        is_redundant = (
+            result.rejection_reason is not None
+            and "redundant" in result.rejection_reason
+        )
+        if is_redundant:
+            return result.pnl
+
         reward = 0.0
 
         # Terminal reward (realized P&L)
@@ -372,37 +382,13 @@ class TradingGym(gym.Env):
             if position.has_position:
                 reward += position.unrealized_pnl * self.shaping_reward_coef
 
-        # Normalize reward
+        # Clip reward to stable range instead of z-scoring.
+        # Z-scoring shifts the penalty signal as the running mean drifts;
+        # clipping keeps the scale fixed while bounding outliers.
         if self.normalize_rewards:
-            reward = self._normalize_reward(reward)
+            reward = float(np.clip(reward, -3.0, 3.0))
 
         return reward
-
-    def _normalize_reward(self, reward: float) -> float:
-        """
-        Z-score normalize reward using running statistics.
-
-        Args:
-            reward: Raw reward
-
-        Returns:
-            Normalized reward
-        """
-        # Update running statistics
-        self.reward_count += 1
-        delta = reward - self.reward_mean
-        self.reward_mean += delta / self.reward_count
-        delta2 = reward - self.reward_mean
-        self.reward_std = np.sqrt(
-            (self.reward_std**2 * (self.reward_count - 1) + delta * delta2)
-            / self.reward_count
-        )
-
-        # Normalize
-        if self.reward_std > 0:
-            return (reward - self.reward_mean) / self.reward_std
-        else:
-            return 0.0
 
     def render(self):
         """Render environment (optional)."""
