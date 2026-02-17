@@ -5,9 +5,11 @@ Binance Futures data for high-alpha features.
 Provides: funding rate, open interest, liquidations, mark price.
 """
 import asyncio
+import logging
 import json
 import requests
 import websockets
+import numpy as np
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -15,6 +17,8 @@ from collections import deque
 
 BINANCE_FUTURES_API = "https://fapi.binance.com"
 BINANCE_FUTURES_WSS = "wss://fstream.binance.com"
+
+logger = logging.getLogger(__name__)
 
 # Asset to futures symbol mapping
 FUTURES_SYMBOLS = {
@@ -44,6 +48,7 @@ class FuturesState:
     buy_volume: float = 0.0
     sell_volume: float = 0.0
     cvd: float = 0.0  # Cumulative volume delta
+    cvd_history: List[float] = field(default_factory=list)  # For CVD acceleration calc
     trade_count: int = 0
 
     # Trade intensity tracking (for 15-min features)
@@ -65,6 +70,8 @@ class FuturesState:
 
     # Volatility
     realized_vol_1h: float = 0.0  # Rolling 1h volatility
+    realized_vol_5m: float = 0.0  # Rolling 5m volatility
+    returns_history: List[float] = field(default_factory=list)  # Recent 1m returns for vol calc
 
     # Volume
     volume_24h: float = 0.0
@@ -136,7 +143,7 @@ def fetch_funding_rate(asset: str) -> Optional[Dict]:
                 "index_price": float(data["indexPrice"]),
             }
     except Exception as e:
-        print(f"Error fetching funding rate for {asset}: {e}")
+        logger.error(f"Error fetching funding rate for {asset}: {e}")
     return None
 
 
@@ -155,7 +162,7 @@ def fetch_open_interest(asset: str) -> Optional[Dict]:
                 "open_interest": float(data["openInterest"]),
             }
     except Exception as e:
-        print(f"Error fetching OI for {asset}: {e}")
+        logger.error(f"Error fetching OI for {asset}: {e}")
     return None
 
 
@@ -171,7 +178,7 @@ def fetch_klines(asset: str, interval: str = "1m", limit: int = 60) -> Optional[
         if resp.status_code == 200:
             return resp.json()
     except Exception as e:
-        print(f"Error fetching klines for {asset}: {e}")
+        logger.error(f"Error fetching klines for {asset}: {e}")
     return None
 
 
@@ -250,6 +257,59 @@ class FuturesStreamer:
         """Get futures state for an asset."""
         return self.states.get(asset)
 
+    def get_latest(self, asset: str) -> dict:
+        """
+        Get latest futures data for LiveSource integration.
+
+        Returns dict with all necessary futures metrics for feature computation.
+        """
+        state = self.states.get(asset)
+        if not state:
+            return {
+                "price": 0.0,
+                "returns_1m": 0.0,
+                "returns_5m": 0.0,
+                "returns_10m": 0.0,
+                "cvd": 0.0,
+                "cvd_history": [],
+                "trade_flow_imbalance": 0.0,
+                "trade_intensity": 0.0,
+                "large_trade_flag": 0.0,
+                "realized_vol_5m": 0.0,
+                "avg_vol": 0.0,
+                "vol_regime": 0.0,
+                "trend_regime": 0.0,
+            }
+
+        # Compute trade flow imbalance
+        total_volume = state.buy_volume + state.sell_volume
+        trade_flow_imbalance = (
+            (state.buy_volume - state.sell_volume) / total_volume
+            if total_volume > 0
+            else 0.0
+        )
+
+        # Compute regimes
+        avg_vol = state.realized_vol_5m  # Could compute rolling average if needed
+        vol_regime = 1.0 if state.realized_vol_5m > avg_vol else 0.0
+        trend_regime = 1.0 if state.returns_10m > 0.001 else 0.0
+
+        return {
+            "price": state.mark_price,
+            "returns_1m": state.returns_1m,
+            "returns_5m": state.returns_5m,
+            "returns_10m": state.returns_10m,
+            "cvd": state.cvd,
+            "cvd_history": state.cvd_history,
+            "trade_flow_imbalance": trade_flow_imbalance,
+            "trade_intensity": state.trade_count / 60.0,  # Trades per second
+            "large_trade_flag": state.large_trade_flag,
+            "realized_vol_5m": state.realized_vol_5m,
+            "avg_vol": avg_vol,
+            "vol_regime": vol_regime,
+            "trend_regime": trend_regime,
+        }
+
     async def _poll_rest_data(self):
         """Periodically fetch REST data (funding, OI, klines)."""
         while self.running:
@@ -283,6 +343,17 @@ class FuturesStreamer:
                     state.returns_15m = returns["15m"]
                     state.returns_1h = returns["1h"]
                     state.realized_vol_1h = returns["realized_vol_1h"]
+
+                    # Track recent returns for 5m volatility
+                    state.returns_history.append(state.returns_1m)
+                    if len(state.returns_history) > 5:  # Keep last 5 returns
+                        state.returns_history = state.returns_history[-5:]
+
+                    # Compute 5m realized volatility
+                    if len(state.returns_history) >= 5:
+                        state.realized_vol_5m = float(np.std(state.returns_history) * np.sqrt(5))  # Scale to 5min
+                    else:
+                        state.realized_vol_5m = state.realized_vol_1h  # Fallback
 
                     vol_stats = compute_volume_stats(klines)
                     state.volume_1h = vol_stats["volume_1h"]
@@ -354,7 +425,7 @@ class FuturesStreamer:
                             pass
 
             except Exception as e:
-                print(f"Futures trade stream error: {e}")
+                logger.error(f"Futures trade stream error: {e}")
                 await asyncio.sleep(1)
 
     async def _stream_liquidations(self):
@@ -427,11 +498,16 @@ class FuturesStreamer:
                     state.recent_short_liqs *= 0.9
                     state.cvd = state.buy_volume - state.sell_volume
 
+                    # Track CVD history for acceleration calculation
+                    state.cvd_history.append(state.cvd)
+                    if len(state.cvd_history) > 60:  # Keep ~1hr of history
+                        state.cvd_history = state.cvd_history[-60:]
+
     async def stream(self):
         """Start all futures data streams."""
         self.running = True
 
-        print("Starting Binance Futures streams...")
+        logger.info("Starting Binance Futures streams...")
 
         # Initial data fetch
         for asset in self.assets:
@@ -441,7 +517,7 @@ class FuturesStreamer:
                 if funding:
                     state.funding_rate = funding["funding_rate"]
                     state.mark_price = funding["mark_price"]
-                    print(f"  {asset}: funding={state.funding_rate:.4%}, mark=${state.mark_price:,.2f}")
+                    logger.info(f"  {asset}: funding={state.funding_rate:.4%}, mark=${state.mark_price:,.2f}")
 
         # Run all streams concurrently
         await asyncio.gather(
@@ -494,14 +570,14 @@ def get_futures_snapshot(asset: str) -> Optional[FuturesState]:
 
 if __name__ == "__main__":
     # Test
-    print("Fetching futures data...")
+    logger.info("Fetching futures data...")
 
     for asset in ["BTC", "ETH", "SOL"]:
         state = get_futures_snapshot(asset)
         if state:
-            print(f"\n{asset}:")
-            print(f"  Funding: {state.funding_rate:.4%}")
-            print(f"  Mark: ${state.mark_price:,.2f}")
-            print(f"  OI: {state.open_interest:,.0f}")
-            print(f"  Returns: 1m={state.returns_1m:.3%} 5m={state.returns_5m:.3%} 15m={state.returns_15m:.3%}")
-            print(f"  Vol 1h: ${state.volume_1h:,.0f}")
+            logger.info(f"\n{asset}:")
+            logger.info(f"  Funding: {state.funding_rate:.4%}")
+            logger.info(f"  Mark: ${state.mark_price:,.2f}")
+            logger.info(f"  OI: {state.open_interest:,.0f}")
+            logger.info(f"  Returns: 1m={state.returns_1m:.3%} 5m={state.returns_5m:.3%} 15m={state.returns_15m:.3%}")
+            logger.info(f"  Vol 1h: ${state.volume_1h:,.0f}")

@@ -1,60 +1,63 @@
 """Test script to verify strategy auto-registration works."""
 
+import logging
 from strategies import registry, BaseStrategy, STRATEGIES
+
+logger = logging.getLogger(__name__)
 
 
 def main():
-    print("=" * 60)
-    print("Strategy Auto-Registration Test")
-    print("=" * 60)
-    print()
+    logger.info("=" * 60)
+    logger.info("Strategy Auto-Registration Test")
+    logger.info("=" * 60)
+    logger.info()
 
     # Show registry info
-    print(f"Registry: {registry}")
-    print()
+    logger.info(f"Registry: {registry}")
+    logger.info()
 
     # List all discovered strategies
-    print(f"Discovered {len(registry)} strategies:")
+    logger.info(f"Discovered {len(registry)} strategies:")
     for name in registry.list_names():
-        print(f"  - {name}")
-    print()
+        logger.info(f"  - {name}")
+    logger.info()
 
     # Show STRATEGIES dictionary
-    print("STRATEGIES dictionary:")
+    logger.info("STRATEGIES dictionary:")
     for name, cls in STRATEGIES.items():
-        print(f"  {name}: {cls}")
-    print()
+        logger.info(f"  {name}: {cls}")
+    logger.info()
 
     # Test getting a strategy
     if 'ExampleStrategy' in registry:
-        print("Getting ExampleStrategy class:")
+        logger.info("Getting ExampleStrategy class:")
         strategy_class = registry.get('ExampleStrategy')
-        print(f"  Class: {strategy_class}")
-        print()
+        logger.info(f"  Class: {strategy_class}")
+        logger.info()
 
         # Test creating an instance
-        print("Creating ExampleStrategy instance:")
+        logger.info("Creating ExampleStrategy instance:")
         strategy = registry.create('ExampleStrategy', config={'test': 'value'})
-        print(f"  Instance: {strategy}")
-        print()
+        logger.info(f"  Instance: {strategy}")
+        logger.info()
 
         # Test executing the strategy
-        print("Executing strategy:")
+        logger.info("Executing strategy:")
         result = strategy.execute()
-        print(f"  Result: {result}")
-        print()
+        logger.info(f"  Result: {result}")
+        logger.info()
 
     # Test all strategies
-    print("Testing all strategies:")
+    logger.info("Testing all strategies:")
     for name in registry.list_names():
         strategy = registry.create(name, config={'test_param': 123})
         result = strategy.execute()
-        print(f"  {name}: {result}")
-    print()
+        logger.info(f"  {name}: {result}")
+    logger.info()
 
-    print("=" * 60)
-    print("All tests passed! ✓")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("All tests passed! ✓")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":

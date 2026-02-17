@@ -5,6 +5,7 @@ Cinematic Dashboard v2 - With PnL chart and trade visualization.
 Usage:
     python dashboard_cinematic.py
 """
+import logging
 import threading
 import time
 from datetime import datetime, timezone
@@ -28,6 +29,8 @@ class DashboardState:
         self.avg_reward = 0.0
 
 dashboard_state = DashboardState()
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'cinematic'
@@ -807,8 +810,8 @@ def run_dashboard(host='0.0.0.0', port=5051):
     import os
     port = int(os.environ.get('PORT', port))
 
-    print(f"\n  Cinematic Dashboard v2")
-    print(f"  http://localhost:{port}\n")
+    logger.info("Cinematic Dashboard v2")
+    logger.info(f"http://localhost:{port}")
 
     emitter_thread = threading.Thread(target=state_emitter, daemon=True)
     emitter_thread.start()

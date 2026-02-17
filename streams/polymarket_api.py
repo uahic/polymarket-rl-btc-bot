@@ -2,6 +2,7 @@
 Polymarket API helpers for 15-min up/down markets.
 Finds BTC, ETH, SOL, XRP markets using slug pattern.
 """
+import logging
 import requests
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from typing import List, Optional, Dict
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
+
+logger = logging.getLogger(__name__)
 
 # 15-min assets (slug pattern: {asset}-updown-15m-{timestamp})
 ASSETS_15M = ["btc", "eth", "sol", "xrp"]
@@ -159,22 +162,22 @@ get_active_markets = get_15m_markets
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("15-MIN UP/DOWN MARKETS")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("15-MIN UP/DOWN MARKETS")
+    logger.info("=" * 60)
 
     markets = get_15m_markets()
     now = datetime.now(timezone.utc)
 
     if not markets:
-        print("\nNo active 15-min markets found!")
+        logger.info("\nNo active 15-min markets found!")
     else:
         for m in markets:
             mins_left = (m.end_time - now).total_seconds() / 60
-            print(f"\n{m.asset} 15m")
-            print(f"  {m.question}")
-            print(f"  Closes in: {mins_left:.1f} min")
-            print(f"  UP: {m.price_up:.3f} | DOWN: {m.price_down:.3f}")
-            print(f"  Condition: {m.condition_id}")
-            print(f"  Token UP: {m.token_up}")
-            print(f"  Token DOWN: {m.token_down}")
+            logger.info(f"\n{m.asset} 15m")
+            logger.info(f"  {m.question}")
+            logger.info(f"  Closes in: {mins_left:.1f} min")
+            logger.info(f"  UP: {m.price_up:.3f} | DOWN: {m.price_down:.3f}")
+            logger.info(f"  Condition: {m.condition_id}")
+            logger.info(f"  Token UP: {m.token_up}")
+            logger.info(f"  Token DOWN: {m.token_down}")

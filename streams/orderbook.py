@@ -2,6 +2,7 @@
 Polymarket CLOB WebSocket helpers for orderbook streaming.
 """
 import asyncio
+import logging
 import json
 import websockets
 from datetime import datetime, timezone
@@ -9,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Callable, Optional
 
 CLOB_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,6 +56,7 @@ class OrderbookStreamer:
         self._pending_subs: List[str] = []  # New token IDs to subscribe
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._force_reconnect = False  # Flag to trigger reconnection
+        self._active_condition_ids: set = set()  # Track currently active markets
 
     def subscribe(self, condition_id: str, token_up: str, token_down: str):
         """Subscribe to orderbook for a market."""
@@ -71,7 +75,7 @@ class OrderbookStreamer:
             added.append("DOWN")
 
         if added:
-            print(f"  [OB] Queued {condition_id[:8]}... ({', '.join(added)}) - pending: {len(self._pending_subs)}")
+            logger.debug(f"  [OB] Queued {condition_id[:8]}... ({', '.join(added)}) - pending: {len(self._pending_subs)}")
 
         # Initialize orderbook states
         self.orderbooks[f"{condition_id}_UP"] = OrderbookState(
@@ -86,7 +90,12 @@ class OrderbookStreamer:
         )
 
     def clear_stale(self, active_condition_ids: set):
-        """Remove orderbooks for expired markets and trigger reconnection."""
+        """Remove orderbooks for expired markets and trigger reconnection only when markets change."""
+        # Check if the active markets have actually changed
+        if active_condition_ids == self._active_condition_ids:
+            # No change in markets, skip cleanup
+            return
+
         stale_keys = [k for k in self.orderbooks.keys()
                       if k.rsplit('_', 1)[0] not in active_condition_ids]
 
@@ -99,10 +108,12 @@ class OrderbookStreamer:
         self._subscriptions = [(cid, tid, side) for cid, tid, side in self._subscriptions
                                if cid in active_condition_ids]
 
-        # If we removed subscriptions, force reconnect to cleanly re-subscribe
-        # This fixes the issue where WSS gets stuck on stale token IDs
-        if had_stale or len(self._subscriptions) < old_sub_count:
-            print(f"  [OB] Cleared {len(stale_keys)} stale orderbooks, triggering reconnect")
+        # Update the tracked active markets
+        self._active_condition_ids = active_condition_ids.copy()
+
+        # Only reconnect if we actually removed stale subscriptions
+        if had_stale and len(self._subscriptions) < old_sub_count:
+            logger.info(f"  [OB] Cleared {len(stale_keys)} stale orderbooks, triggering reconnect")
             self._force_reconnect = True
 
     def on_update(self, callback: Callable):
@@ -112,6 +123,49 @@ class OrderbookStreamer:
     def get_orderbook(self, condition_id: str, side: str) -> Optional[OrderbookState]:
         """Get orderbook state for a market side."""
         return self.orderbooks.get(f"{condition_id}_{side}")
+
+    def get_latest(self, condition_id: str) -> dict:
+        """
+        Get latest orderbook data for LiveSource integration.
+
+        Returns dict with aggregated orderbook metrics for both sides.
+        """
+        ob_up = self.get_orderbook(condition_id, "UP")
+        ob_down = self.get_orderbook(condition_id, "DOWN")
+
+        if not ob_up or not ob_down:
+            return {
+                "best_bid": 0.5,
+                "best_ask": 0.5,
+                "spread": 0.0,
+                "mid_price": 0.5,
+                "bids_l5": [],
+                "asks_l5": [],
+                "order_book_imbalance_l1": 0.0,
+                "order_book_imbalance_l5": 0.0,
+            }
+
+        # Compute L1 and L5 imbalances
+        def compute_imbalance(bids, asks, depth=1):
+            """Compute order book imbalance: (bid_vol - ask_vol) / (bid_vol + ask_vol)"""
+            bid_vol = sum(size for _, size in bids[:depth])
+            ask_vol = sum(size for _, size in asks[:depth])
+            total_vol = bid_vol + ask_vol
+            return (bid_vol - ask_vol) / total_vol if total_vol > 0 else 0.0
+
+        imbalance_l1 = compute_imbalance(ob_up.bids, ob_up.asks, depth=1)
+        imbalance_l5 = compute_imbalance(ob_up.bids, ob_up.asks, depth=5)
+
+        return {
+            "best_bid": ob_up.best_bid,
+            "best_ask": ob_up.best_ask,
+            "spread": ob_up.spread,
+            "mid_price": ob_up.mid_price,
+            "bids_l5": ob_up.bids[:5],
+            "asks_l5": ob_up.asks[:5],
+            "order_book_imbalance_l1": imbalance_l1,
+            "order_book_imbalance_l5": imbalance_l5,
+        }
 
     async def stream(self):
         """Start streaming orderbooks."""
@@ -129,7 +183,7 @@ class OrderbookStreamer:
 
             try:
                 async with websockets.connect(CLOB_WSS) as ws:
-                    print("✓ Connected to Polymarket CLOB WSS")
+                    logger.info("Connected to Polymarket CLOB WSS")
 
                     # Collect all token IDs for initial subscription
                     token_ids = [token_id for _, token_id, _ in self._subscriptions]
@@ -146,7 +200,7 @@ class OrderbookStreamer:
                             "type": "market"
                         }
                         await ws.send(json.dumps(sub_msg))
-                        print(f"  Subscribed to {len(token_ids)} orderbooks")
+                        logger.info(f"Subscribed to {len(token_ids)} orderbooks")
 
                     self._ws = ws
 
@@ -155,7 +209,7 @@ class OrderbookStreamer:
                         try:
                             # Check for forced reconnection (markets changed)
                             if self._force_reconnect:
-                                print("  [OB] Force reconnect triggered, closing connection...")
+                                logger.info("[OB] Force reconnect triggered, closing connection...")
                                 self._force_reconnect = False
                                 break  # Exit inner loop to reconnect
 
@@ -168,7 +222,7 @@ class OrderbookStreamer:
                                     "type": "market"
                                 }
                                 await ws.send(json.dumps(sub_msg))
-                                print(f"  [OB] Sent subscription for {len(new_tokens)} new tokens")
+                                logger.info(f"[OB] Sent subscription for {len(new_tokens)} new tokens")
 
                             # Short timeout to check pending subs frequently
                             msg = await asyncio.wait_for(ws.recv(), timeout=0.1)
@@ -196,7 +250,7 @@ class OrderbookStreamer:
                     self._ws = None
 
             except Exception as e:
-                print(f"CLOB WSS error: {e}, reconnecting...")
+                logger.warning(f"CLOB WSS error: {e}, reconnecting...")
                 await asyncio.sleep(1)
 
     def _handle_book_update(self, data: dict):
@@ -240,7 +294,7 @@ class OrderbookStreamer:
 
     def reconnect(self):
         """Force a reconnection to pick up new subscriptions cleanly."""
-        print("  [OB] Manual reconnect requested")
+        logger.info("[OB] Manual reconnect requested")
         self._force_reconnect = True
 
     def stop(self):
@@ -252,23 +306,23 @@ if __name__ == "__main__":
     # Test with a real market
     from polymarket_api import get_active_markets
 
-    print("Testing Orderbook WSS...")
+    logger.info("Testing Orderbook WSS...")
 
     async def test():
         markets = get_active_markets()
 
         if not markets:
-            print("No active markets!")
+            logger.warning("No active markets!")
             return
 
         m = markets[0]
-        print(f"\nSubscribing to: {m.question[:50]}...")
+        logger.info(f"Subscribing to: {m.question[:50]}...")
 
         streamer = OrderbookStreamer()
         streamer.subscribe(m.condition_id, m.token_up, m.token_down)
 
         def on_update(ob: OrderbookState):
-            print(f"  {ob.side}: bid={ob.best_bid:.3f} ask={ob.best_ask:.3f} spread={ob.spread:.3f}")
+            logger.info(f"  {ob.side}: bid={ob.best_bid:.3f} ask={ob.best_ask:.3f} spread={ob.spread:.3f}")
 
         streamer.on_update(on_update)
 

@@ -2,9 +2,9 @@ from enum import Enum
 
 
 class Action(Enum):
-    HOLD = 0
-    BUY = 1   # Buy UP token
-    SELL = 2  # Sell UP token
+    BUY = 0   # Buy UP token (action index 0)
+    HOLD = 1  # Hold position (action index 1)
+    SELL = 2  # Sell UP token / Buy DOWN token (action index 2)
 
     @property
     def is_buy(self) -> bool:

@@ -12,6 +12,7 @@ Guides the user through setting up the trading bot:
 This script should be run once to initialize the trading bot.
 """
 
+import logging
 import os
 import sys
 import json
@@ -28,7 +29,7 @@ from security.key_store import EncryptedKeyStore, verify_private_key
 from config import Config
 from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
 
-
+logger = logging.getLogger(__name__)
 
 # ANSI color codes
 class Colors:
@@ -42,31 +43,31 @@ class Colors:
 
 def print_header(title: str) -> None:
     """Print a section header."""
-    print(f"\n{Colors.BOLD}{Colors.BLUE}{'=' * 50}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.BLUE}{title:^50}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.BLUE}{'=' * 50}{Colors.RESET}\n")
+    logger.info(f"\n{Colors.BOLD}{Colors.BLUE}{'=' * 50}{Colors.RESET}")
+    logger.info(f"{Colors.BOLD}{Colors.BLUE}{title:^50}{Colors.RESET}")
+    logger.info(f"{Colors.BOLD}{Colors.BLUE}{'=' * 50}{Colors.RESET}\n")
 
 
 def print_success(msg: str) -> None:
-    print(f"{Colors.GREEN}✓{Colors.RESET} {msg}")
+    logger.info(f"{Colors.GREEN}✓{Colors.RESET} {msg}")
 
 
 def print_warning(msg: str) -> None:
-    print(f"{Colors.YELLOW}⚠{Colors.RESET} {msg}")
+    logger.info(f"{Colors.YELLOW}⚠{Colors.RESET} {msg}")
 
 
 def print_error(msg: str) -> None:
-    print(f"{Colors.RED}✗{Colors.RESET} {msg}")
+    logger.info(f"{Colors.RED}✗{Colors.RESET} {msg}")
 
 
 def print_step(step: int, total: int, title: str) -> None:
-    print(f"\n{Colors.BOLD}Step {step}/{total}: {title}{Colors.RESET}")
+    logger.info(f"\n{Colors.BOLD}Step {step}/{total}: {title}{Colors.RESET}")
 
 
 def input_private_key() -> str:
     """Get and validate private key from user."""
-    print("Enter your MetaMask private key (will be encrypted and stored securely)")
-    print(f"{Colors.YELLOW}Tip: Open MetaMask → Account Details → Export Private Key{Colors.RESET}\n")
+    logger.info("Enter your MetaMask private key (will be encrypted and stored securely)")
+    logger.info(f"{Colors.YELLOW}Tip: Open MetaMask → Account Details → Export Private Key{Colors.RESET}\n")
 
     while True:
         private_key = getpass(f"{Colors.BOLD}Private Key{Colors.RESET}: ").strip()
@@ -87,8 +88,8 @@ def input_private_key() -> str:
 
 def input_password() -> str:
     """Get and confirm encryption password."""
-    print("Set a password to encrypt your private key")
-    print(f"{Colors.YELLOW}This password is required to start the trading bot{Colors.RESET}\n")
+    logger.info("Set a password to encrypt your private key")
+    logger.info(f"{Colors.YELLOW}This password is required to start the trading bot{Colors.RESET}\n")
 
     while True:
         password = getpass(f"{Colors.BOLD}Password{Colors.RESET}: ").strip()
@@ -108,8 +109,8 @@ def input_password() -> str:
 
 def input_safe_address() -> str:
     """Get Safe address from user."""
-    print("Enter your Polymarket Safe/Proxy wallet address")
-    print(f"{Colors.YELLOW}Tip: polymarket.com/settings → General → Wallet Address{Colors.RESET}\n")
+    logger.info("Enter your Polymarket Safe/Proxy wallet address")
+    logger.info(f"{Colors.YELLOW}Tip: polymarket.com/settings → General → Wallet Address{Colors.RESET}\n")
 
     while True:
         address = input(f"{Colors.BOLD}Safe Address{Colors.RESET}: ").strip().lower()
@@ -127,9 +128,9 @@ def input_safe_address() -> str:
 
 def input_builder_credentials() -> dict:
     """Get Builder Program credentials (optional)."""
-    print(f"{Colors.BLUE}Builder Program Credentials (optional){Colors.RESET}")
-    print("If you have Builder Program access, enter your credentials for gasless trading")
-    print(f"{Colors.YELLOW}Leave empty to skip (you'll pay gas fees yourself){Colors.RESET}\n")
+    logger.info(f"{Colors.BLUE}Builder Program Credentials (optional){Colors.RESET}")
+    logger.info("If you have Builder Program access, enter your credentials for gasless trading")
+    logger.info(f"{Colors.YELLOW}Leave empty to skip (you'll pay gas fees yourself){Colors.RESET}\n")
 
     api_key = input(f"{Colors.BOLD}Builder API Key{Colors.RESET} (Enter to skip): ").strip()
     if not api_key:
@@ -179,8 +180,8 @@ def create_config(
 def main():
     """Main setup function."""
     print_header("Polymarket Trading Bot Setup")
-    print(f"{Colors.BLUE}This script will help you configure the trading bot.{Colors.RESET}")
-    print(f"{Colors.BLUE}Your private key will be encrypted and stored securely.{Colors.RESET}")
+    logger.info(f"{Colors.BLUE}This script will help you configure the trading bot.{Colors.RESET}")
+    logger.info(f"{Colors.BLUE}Your private key will be encrypted and stored securely.{Colors.RESET}")
 
     # Step 1: Private Key
     print_step(1, 4, "Private Key")
@@ -203,46 +204,46 @@ def main():
     builder_creds = input_builder_credentials()
 
     # Create directories
-    print("\nCreating directories...")
+    logger.info("\nCreating directories...")
     Path("credentials").mkdir(exist_ok=True)
     print_success("Created credentials/ directory")
 
     # Encrypt and save private key
-    print("\nEncrypting private key...")
+    logger.info("\nEncrypting private key...")
     manager = EncryptedKeyStore()
     key_path = manager.encrypt_and_save(private_key, password, "credentials/encrypted_key.json")
     print_success(f"Encrypted key saved to {key_path}")
 
     # Create config.yaml
-    print("\nCreating config.yaml...")
+    logger.info("\nCreating config.yaml...")
     config = create_config(safe_address, builder_creds)
     config.save("config.yaml")
     print_success("config.yaml created")
 
     # Summary
     print_header("Setup Complete!")
-    print(f"{Colors.GREEN}✓{Colors.RESET} Private key encrypted and saved")
-    print(f"{Colors.GREEN}✓{Colors.RESET} Config file created")
-    print(f"{Colors.GREEN}✓{Colors.RESET} Ready to trade!\n")
+    logger.info(f"{Colors.GREEN}✓{Colors.RESET} Private key encrypted and saved")
+    logger.info(f"{Colors.GREEN}✓{Colors.RESET} Config file created")
+    logger.info(f"{Colors.GREEN}✓{Colors.RESET} Ready to trade!\n")
 
-    print(f"{Colors.BOLD}Next steps:{Colors.RESET}")
-    print("1. Test the setup: python scripts/run_bot.py")
-    print("2. Customize config.yaml if needed")
-    print("3. Build your trading strategy!\n")
+    logger.info(f"{Colors.BOLD}Next steps:{Colors.RESET}")
+    logger.info("1. Test the setup: python scripts/run_bot.py")
+    logger.info("2. Customize config.yaml if needed")
+    logger.info("3. Build your trading strategy!\n")
 
     if builder_creds:
-        print(f"{Colors.GREEN}Gasless mode: ENABLED{Colors.RESET}")
+        logger.info(f"{Colors.GREEN}Gasless mode: ENABLED{Colors.RESET}")
     else:
         print_warning("Gasless mode: DISABLED (no Builder credentials)")
-        print(f"{Colors.YELLOW}To enable later, add Builder credentials to config.yaml{Colors.RESET}")
+        logger.info(f"{Colors.YELLOW}To enable later, add Builder credentials to config.yaml{Colors.RESET}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\nSetup cancelled.")
+        logger.info("\n\nSetup cancelled.")
         sys.exit(0)
     except Exception as e:
-        print(f"\n{Colors.RED}Error: {e}{Colors.RESET}")
+        logger.info(f"\n{Colors.RED}Error: {e}{Colors.RESET}")
         sys.exit(1)

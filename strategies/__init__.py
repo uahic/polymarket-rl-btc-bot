@@ -1,3 +1,4 @@
+import logging
 """
 Trading strategies package with auto-discovery and registration.
 
@@ -15,7 +16,7 @@ Example:
     from strategies import registry, BaseStrategy
 
     # List all available strategies
-    print(registry.list_names())
+    logger.info(registry.list_names())
 
     # Get a specific strategy class
     MyStrategy = registry.get('MyStrategy')
@@ -30,6 +31,8 @@ Example:
 from .base_strategy import BaseStrategy
 from .ml_base_strategy import MLStrategy
 from .registry import StrategyRegistry
+
+logger = logging.getLogger(__name__)
 
 # Create global registry instance
 registry = StrategyRegistry()

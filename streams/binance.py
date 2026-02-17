@@ -3,6 +3,7 @@ Binance WebSocket helpers for real-time crypto price data.
 """
 
 import asyncio
+import logging
 import json
 import websockets
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Callable, Optional
 
 BINANCE_WSS = "wss://stream.binance.com:9443"
+
+logger = logging.getLogger(__name__)
 
 # Asset to Binance symbol mapping
 SYMBOLS = {
@@ -68,6 +71,13 @@ class BinanceStreamer:
         state = self.states.get(asset)
         return state.history[-n:] if state else []
 
+    def get_latest(self, asset: str) -> dict:
+        """Get latest spot price data for LiveSource integration."""
+        state = self.states.get(asset)
+        return {
+            "price": state.price if state else 0.0,
+        }
+
     async def stream(self):
         """Start streaming prices."""
         if self.running is True:
@@ -80,12 +90,12 @@ class BinanceStreamer:
         streams = "/".join([f"{s}@trade" for s in symbols])
         url = f"{BINANCE_WSS}/stream?streams={streams}"
 
-        print(f"Connecting to Binance WSS for {', '.join(self.assets)}...")
+        logger.info(f"Connecting to Binance WSS for {', '.join(self.assets)}...")
 
         while self.running:
             try:
                 async with websockets.connect(url) as ws:
-                    print("✓ Connected to Binance")
+                    logger.info("Connected to Binance")
 
                     while self.running:
                         try:
@@ -118,7 +128,7 @@ class BinanceStreamer:
                             pass
 
             except Exception as e:
-                print(f"WSS error: {e}, reconnecting...")
+                logger.warning(f"WSS error: {e}, reconnecting...")
                 await asyncio.sleep(1)
 
     def stop(self):
@@ -165,8 +175,8 @@ if __name__ == "__main__":
 
     async def test():
         prices = await get_current_prices(["BTC", "ETH", "SOL", "XRP"])
-        print("Current prices:")
+        logger.info("Current prices:")
         for asset, price in prices.items():
-            print(f"  {asset}: ${price:,.2f}")
+            logger.info(f"  {asset}: ${price:,.2f}")
 
     asyncio.run(test())

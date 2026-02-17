@@ -1,3 +1,4 @@
+import logging
 import httpx
 
 from py_clob_client.clob_types import (
@@ -10,6 +11,8 @@ from py_clob_client.clob_types import (
 )
 
 from py_clob_client.exceptions import PolyApiException
+
+logger = logging.getLogger(__name__)
 
 GET = "GET"
 POST = "POST"
@@ -40,14 +43,11 @@ def overloadHeaders(method: str, headers: dict) -> dict:
 async def request(endpoint: str, method: str, headers=None, data=None):
     # Debug logging for order requests (if enabled)
     if DEBUG_ORDERS and "order" in endpoint.lower():
-        from pprint import pprint
-        print(f"\n[DEBUG] Endpoint: {endpoint}")
-        print(f"[DEBUG] Method: {method}")
-        print(f"[DEBUG] Headers:")
-        pprint(headers)
-        print(f"[DEBUG] Data:")
-        pprint(data)
-        print()
+        from pprint import pformat
+        logger.debug(f"[DEBUG] Endpoint: {endpoint}")
+        logger.debug(f"[DEBUG] Method: {method}")
+        logger.debug(f"[DEBUG] Headers: {pformat(headers)}")
+        logger.debug(f"[DEBUG] Data: {pformat(data)}")
 
     try:
         headers = overloadHeaders(method, headers)
@@ -71,14 +71,14 @@ async def request(endpoint: str, method: str, headers=None, data=None):
 
         if resp.status_code != 200:
             # Enhanced error logging
-            print(f"\n[API ERROR] Status: {resp.status_code}")
-            print(f"[API ERROR] Endpoint: {endpoint}")
-            print(f"[API ERROR] Method: {method}")
+            logger.error(f"[API ERROR] Status: {resp.status_code}")
+            logger.error(f"[API ERROR] Endpoint: {endpoint}")
+            logger.error(f"[API ERROR] Method: {method}")
             try:
                 error_body = resp.json()
-                print(f"[API ERROR] Response: {error_body}")
+                logger.error(f"[API ERROR] Response: {error_body}")
             except:
-                print(f"[API ERROR] Response Text: {resp.text}")
+                logger.error(f"[API ERROR] Response Text: {resp.text}")
             raise PolyApiException(resp)
 
         try:
@@ -87,8 +87,8 @@ async def request(endpoint: str, method: str, headers=None, data=None):
             return resp.text
 
     except httpx.RequestError as e:
-        print(f"\n[REQUEST ERROR] {type(e).__name__}: {e}")
-        print(f"[REQUEST ERROR] Endpoint: {endpoint}")
+        logger.error(f"[REQUEST ERROR] {type(e).__name__}: {e}")
+        logger.error(f"[REQUEST ERROR] Endpoint: {endpoint}")
         raise PolyApiException(error_msg="Request exception!")
 
 

@@ -1,10 +1,13 @@
 """Registry for auto-discovering and managing strategy classes."""
 
+import logging
 import inspect
 import importlib
 import pkgutil
 from typing import Type, Dict, Optional, List
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class StrategyRegistry:
@@ -44,13 +47,13 @@ class StrategyRegistry:
             Dictionary mapping strategy names to strategy classes
         """
 
-        print(f"Running Strategy discovery in package {package_name}")
+        logger.info(f"Running Strategy discovery in package {package_name}")
         try:
             # Import the package
             package = importlib.import_module(package_name)
             package_path = package.__path__
         except (ImportError, AttributeError) as e:
-            print(f"Failed to import package {package_name}: {e}")
+            logger.error(f"Failed to import package {package_name}: {e}")
             return self._strategies
 
         # Iterate through all modules in the package
@@ -66,7 +69,7 @@ class StrategyRegistry:
             try:
                 module = importlib.import_module(modname)
             except ImportError as e:
-                print(f"Failed to import {modname}: {e}")
+                logger.warning(f"Failed to import {modname}: {e}")
                 continue
 
             # Find all classes in the module

@@ -2,18 +2,22 @@ import torch
 import numpy as np
 import torch.nn as nn
 from collections import deque
+from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from .base_strategy import BaseStrategy, MarketState, Action
 from .ml_base_strategy import MLStrategy
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Experience:
     """Single experience tuple with temporal context."""
 
-    state: np.ndarray  # Current state features (21,)
-    temporal_state: np.ndarray  # Stacked temporal features (history_len * 21,)
+    state: np.ndarray  # Current state features (29,) = 26 base features + 3 prev action one-hot
+    temporal_state: np.ndarray  # Stacked temporal features (history_len * 29,)
     action: int
     reward: float
     next_state: np.ndarray
@@ -24,45 +28,54 @@ class Experience:
 
 
 class TemporalEncoder(nn.Module):
-    """Encodes temporal sequence of states into momentum/trend features.
+    """Encodes temporal sequence of states into momentum/trend features using a GRU.
 
-    Takes last N states and compresses them into a fixed-size representation
-    that captures velocity, acceleration, and trend direction.
+    A GRU respects the sequential ordering of states (oldest → newest), which
+    a flat MLP over stacked states cannot. This lets the network learn velocity
+    and acceleration patterns directly from the sequence structure.
 
-    Architecture: (history_len * 22) → 64 → LayerNorm → tanh → 32
-    Output is concatenated with current state features.
+    Input:  (batch, history_len * input_dim)  — flattened for API compatibility
+    Internally reshaped to (batch, history_len, input_dim) for the GRU.
+    Output: (batch, output_dim)  — last hidden state of the GRU
     """
 
-    def __init__(self, input_dim: int = 22, history_len: int = 5, output_dim: int = 32):
+    def __init__(self, input_dim: int = 29, history_len: int = 5, output_dim: int = 32):
         super().__init__()
+        self.input_dim = input_dim
         self.history_len = history_len
-        self.temporal_input = input_dim * history_len
-        self.fc1 = nn.Linear(self.temporal_input, 64)
-        self.ln1 = nn.LayerNorm(64)
-        self.fc2 = nn.Linear(64, output_dim)
-        self.ln2 = nn.LayerNorm(output_dim)
+        self.gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=output_dim,
+            num_layers=1,
+            batch_first=True,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass. x is (batch, history_len * input_dim)."""
-        h = torch.tanh(self.ln1(self.fc1(x)))
-        h = torch.tanh(self.ln2(self.fc2(h)))
-        return h
+        batch_size = x.size(0)
+        # Reshape: (batch, history_len * input_dim) → (batch, history_len, input_dim)
+        x = x.view(batch_size, self.history_len, self.input_dim)
+        # GRU: output shape (batch, history_len, output_dim), h_n shape (1, batch, output_dim)
+        _, h_n = self.gru(x)
+        # Return last hidden state: (batch, output_dim)
+        return h_n.squeeze(0)
 
 
 class Actor(nn.Module):
-    """Policy network with temporal awareness.
+    """Policy network with GRU-based temporal awareness.
 
     Architecture:
-        Current state (22) + Temporal features (32) = 54
+        Current state (29) + GRU temporal features (32) = 61
         → 64 → LayerNorm → tanh → 64 → LayerNorm → tanh → 3 (softmax)
 
-    Temporal encoder captures momentum/trends from state history.
+    Temporal encoder is a GRU that processes the ordered state history,
+    capturing velocity and acceleration patterns directly from sequence structure.
     Smaller network (64) to prevent overfitting on enhanced features.
     """
 
     def __init__(
         self,
-        input_dim: int = 22,
+        input_dim: int = 29,
         hidden_size: int = 64,
         output_dim: int = 3,
         history_len: int = 5,
@@ -85,10 +98,10 @@ class Actor(nn.Module):
         """Forward pass. Returns action probabilities.
 
         Args:
-            current_state: (batch, 22) current features
-            temporal_state: (batch, history_len * 22) stacked history
+            current_state: (batch, 29) current features with previous action
+            temporal_state: (batch, history_len * 29) stacked history
         """
-        # Encode temporal context
+        # Encode temporal context via GRU (last hidden state)
         temporal_features = self.temporal_encoder(temporal_state)
 
         # Combine current + temporal
@@ -102,10 +115,10 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    """Value network with temporal awareness - ASYMMETRIC (larger than actor).
+    """Value network with GRU-based temporal awareness - ASYMMETRIC (larger than actor).
 
     Architecture:
-        Current state (22) + Temporal features (32) = 54
+        Current state (29) + GRU temporal features (32) = 61
         → 96 → LayerNorm → tanh → 96 → LayerNorm → tanh → 1
 
     Larger network (96 vs 64) because:
@@ -116,7 +129,7 @@ class Critic(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 22,
+        input_dim: int = 29,
         hidden_size: int = 96,
         history_len: int = 5,
         temporal_dim: int = 32,
@@ -138,10 +151,10 @@ class Critic(nn.Module):
         """Forward pass. Returns value estimate.
 
         Args:
-            current_state: (batch, 22) current features
-            temporal_state: (batch, history_len * 22) stacked history
+            current_state: (batch, 29) current features with previous action
+            temporal_state: (batch, history_len * 29) stacked history
         """
-        # Encode temporal context
+        # Encode temporal context via GRU (last hidden state)
         temporal_features = self.temporal_encoder(temporal_state)
 
         # Combine current + temporal
@@ -154,22 +167,30 @@ class Critic(nn.Module):
 
 
 class PPOStrategyV2(MLStrategy):
-    """PPO-based strategy with temporal-aware actor-critic architecture using PyTorch.
+    """PPO-based strategy with GRU temporal-aware actor-critic architecture using PyTorch.
 
     Key features:
-    - Temporal processing: maintains history of last N states to capture momentum
+    - GRU temporal encoder: processes ordered state history, capturing velocity/acceleration
+    - Time-of-day encoding: 4 cyclical features (hour_sin/cos, dow_sin/cos) added to base features
     - Asymmetric architecture: larger critic (96) for better value estimation
     - Low gamma (0.9): focuses on near-term rewards for 15-min horizon
-    - Smaller buffer (256): faster adaptation to regime changes
+    - Larger buffer (2048): diverse experiences for stable gradient updates
+
+    Feature dimensions:
+      Base features:        26  (22 market + 4 time-of-day)
+      + previous action:     3  (one-hot)
+      = input_dim:          29
+      Temporal (GRU out):   32
+      Combined:             61
     """
 
     def __init__(
         self,
-        input_dim: int = 22,
+        input_dim: int = 29,  # 26 base features (22 market + 4 time-of-day) + 3 prev action one-hot
         hidden_size: int = 64,  # Actor hidden size
         critic_hidden_size: int = 96,  # Larger critic for better value estimation
         history_len: int = 5,  # Number of past states for temporal processing
-        temporal_dim: int = 32,  # Temporal encoder output size
+        temporal_dim: int = 32,  # GRU hidden size / temporal encoder output size
         lr_actor: float = 1e-4,
         lr_critic: float = 3e-4,
         gamma: float = 0.9,  # Low gamma for 15-min horizon - focus on near-term rewards
@@ -218,59 +239,85 @@ class PPOStrategyV2(MLStrategy):
         # Experience buffer
         self.experiences: List[Experience] = []
 
-        # Temporal state history (per-market, keyed by asset)
-        self._state_history: Dict[str, deque] = {}
+        # Temporal state history (single buffer for this strategy instance)
+        self._state_history: deque = deque(maxlen=self.history_len)
 
         # Fixed reward scaling (not adaptive normalization)
         # Scale PnL to roughly [-1, 1] range for stability
         self.reward_scale = 0.1  # Divide PnL by 10 (e.g., $10 -> 1.0)
 
-        # For storing last action's log prob and value
+        # For storing last action's log prob, value, and state
         self._last_log_prob = 0.0
         self._last_value = 0.0
         self._last_temporal_state: Optional[np.ndarray] = None
+        self._last_features_with_action: Optional[np.ndarray] = None
+
+        # Track previous action (initialize to HOLD=1)
+        self._previous_action: int = 1
 
         # Set device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.actor.to(self.device)
         self.critic.to(self.device)
 
-    def _get_temporal_state(
-        self, asset: str, current_features: np.ndarray
-    ) -> np.ndarray:
-        """Get stacked temporal state for an asset.
 
-        Maintains a history of the last N states per asset.
-        Returns flattened array of shape (history_len * input_dim,).
+    def _append_previous_action(self, features: np.ndarray) -> np.ndarray:
+        """Append one-hot encoded previous action to features.
+
+        Args:
+            features: Base features (26-dim: 22 market + 4 time-of-day)
+
+        Returns:
+            Extended features (29-dim) = features + one-hot previous action
         """
-        if asset not in self._state_history:
-            self._state_history[asset] = deque(maxlen=self.history_len)
+        # Create one-hot encoding of previous action
+        prev_action_onehot = np.zeros(3, dtype=np.float32)
+        prev_action_onehot[self._previous_action] = 1.0
 
-        history = self._state_history[asset]
+        # Concatenate: [26 features] + [3 action dims] = 29
+        return np.concatenate([features, prev_action_onehot])
 
+    def _get_temporal_state(self, current_features_with_action: np.ndarray) -> np.ndarray:
+        """Get stacked temporal state.
+
+        Maintains a history of the last N states (with previous action appended).
+        Returns flattened array of shape (history_len * input_dim,) which the
+        GRU TemporalEncoder reshapes internally to (batch, history_len, input_dim).
+
+        Args:
+            current_features_with_action: 29-dim features (26 base + 3 prev action)
+        """
         # Add current state to history
-        history.append(current_features.copy())
+        self._state_history.append(current_features_with_action.copy())
 
         # Pad with zeros if not enough history
-        if len(history) < self.history_len:
+        if len(self._state_history) < self.history_len:
             padding = [np.zeros(self.input_dim, dtype=np.float32)] * (
-                self.history_len - len(history)
+                self.history_len - len(self._state_history)
             )
-            stacked = np.concatenate(padding + list(history))
+            stacked = np.concatenate(padding + list(self._state_history))
         else:
-            stacked = np.concatenate(list(history))
+            stacked = np.concatenate(list(self._state_history))
 
         return stacked.astype(np.float32)
 
-    def act(self, state: MarketState) -> Action:
-        """Select action using current policy with temporal context."""
-        features = state.to_features()
+    def act(self, features: np.ndarray) -> Action:
+        """Select action using current policy with temporal context.
 
-        # Get temporal state (stacked history)
-        temporal_state = self._get_temporal_state(state.asset, features)
+        Args:
+            features: 26-dimensional base feature vector (22 market + 4 time-of-day)
+
+        Returns:
+            Action index (0=BUY_UP, 1=HOLD, 2=SELL_DOWN)
+        """
+        # Append previous action to features (26 -> 29)
+        features_with_action = self._append_previous_action(features)
+
+        # Get temporal state (stacked history of 29-dim states)
+        temporal_state = self._get_temporal_state(features_with_action)
 
         # Convert to PyTorch tensors
-        features_tensor = torch.tensor(features.reshape(1, -1), dtype=torch.float32, device=self.device)
+        features_tensor = torch.tensor(features_with_action.reshape(1, -1), dtype=torch.float32, device=self.device)
         temporal_tensor = torch.tensor(temporal_state.reshape(1, -1), dtype=torch.float32, device=self.device)
 
         # Get action probabilities and value with temporal context
@@ -292,36 +339,71 @@ class PPOStrategyV2(MLStrategy):
         self._last_log_prob = float(np.log(probs_np[action_idx] + 1e-8))
         self._last_value = value_np
         self._last_temporal_state = temporal_state
+        self._last_features_with_action = features_with_action
+
+        # Update previous action for next step
+        self._previous_action = action_idx
 
         return Action(action_idx)
 
     def store(
         self,
-        state: MarketState,
+        features: np.ndarray,
         action: Action,
         reward: float,
-        next_state: MarketState,
+        next_features: np.ndarray,
         done: bool,
     ):
-        """Store experience for training with temporal context."""
+        """Store experience for training with temporal context.
+
+        Args:
+            features: Current state features (26-dim: 22 market + 4 time-of-day)
+            action: Action taken (Action enum)
+            reward: Reward received
+            next_features: Next state features (26-dim: 22 market + 4 time-of-day)
+            done: Whether episode ended
+        """
         # Apply fixed scaling to reward (not adaptive normalization)
         # This keeps rewards in a stable range without moving targets
         scaled_reward = reward * self.reward_scale
 
-        # Get next temporal state (updates history with next_state)
-        next_features = next_state.to_features()
-        next_temporal_state = self._get_temporal_state(next_state.asset, next_features)
+        # Use the state that act() actually saw — cached before _previous_action was updated.
+        # Recomputing here would use the post-update _previous_action and produce the wrong state.
+        features_with_action = (
+            self._last_features_with_action
+            if self._last_features_with_action is not None
+            else self._append_previous_action(features)
+        )
+
+        # For next_features, append the action just taken (becomes the "previous action" at t+1)
+        action_idx = action.value
+        next_action_onehot = np.zeros(3, dtype=np.float32)
+        next_action_onehot[action_idx] = 1.0
+        next_features_with_action = np.concatenate([next_features, next_action_onehot])
+
+        # Compute next temporal state by peeking at history without mutating it.
+        # _get_temporal_state() appends to _state_history; calling it here would corrupt the
+        # sequence that act() relies on (it would interleave act-states with store-states).
+        history_list = list(self._state_history)  # current history after act() appended to it
+        history_list.append(next_features_with_action)  # peek: what history looks like at t+1
+        if len(history_list) < self.history_len:
+            padding = [np.zeros(self.input_dim, dtype=np.float32)] * (
+                self.history_len - len(history_list)
+            )
+            next_temporal_state = np.concatenate(padding + history_list).astype(np.float32)
+        else:
+            next_temporal_state = np.concatenate(history_list[-self.history_len :]).astype(np.float32)
 
         exp = Experience(
-            state=state.to_features(),
+            state=features_with_action,
             temporal_state=(
                 self._last_temporal_state
                 if self._last_temporal_state is not None
                 else np.zeros(self.history_len * self.input_dim, dtype=np.float32)
             ),
-            action=action.value,
+            action=action_idx,
             reward=scaled_reward,
-            next_state=next_features,
+            next_state=next_features_with_action,
             next_temporal_state=next_temporal_state,
             done=done,
             log_prob=self._last_log_prob,
@@ -366,10 +448,21 @@ class PPOStrategyV2(MLStrategy):
         """Clip gradients by global norm using PyTorch."""
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
+    def should_update(self) -> bool:
+        """Check if buffer is full and ready for update."""
+        return len(self.experiences) >= self.buffer_size
+
     def update(self) -> Optional[Dict[str, float]]:
         """Update policy using PPO with PyTorch autograd and temporal context."""
         if len(self.experiences) < self.buffer_size:
             return None
+
+        # Print training indicator
+        # print(f"\n{'='*60}")
+        # print(f"  PPO TRAINING UPDATE")
+        # print(f"  Buffer: {len(self.experiences)}/{self.buffer_size} experiences")
+        # print(f"  Epochs: {self.n_epochs} | Batch Size: {self.batch_size}")
+        # print(f"{'='*60}\n")
 
         # Convert experiences to arrays (including temporal states)
         states = np.array([e.state for e in self.experiences], dtype=np.float32)
@@ -407,7 +500,6 @@ class PPOStrategyV2(MLStrategy):
         old_log_probs_tensor = torch.tensor(old_log_probs, dtype=torch.float32, device=self.device)
         advantages_tensor = torch.tensor(advantages.astype(np.float32), dtype=torch.float32, device=self.device)
         returns_tensor = torch.tensor(returns.astype(np.float32), dtype=torch.float32, device=self.device)
-        old_values_tensor = torch.tensor(old_values, dtype=torch.float32, device=self.device)
 
         n_samples = len(self.experiences)
         all_metrics = {
@@ -437,7 +529,6 @@ class PPOStrategyV2(MLStrategy):
                 batch_old_log_probs = old_log_probs_tensor[batch_idx]
                 batch_advantages = advantages_tensor[batch_idx]
                 batch_returns = returns_tensor[batch_idx]
-                batch_old_values = old_values_tensor[batch_idx]
 
                 # Actor update
                 self.actor_optimizer.zero_grad()
@@ -479,10 +570,10 @@ class PPOStrategyV2(MLStrategy):
 
                 # Critic update
                 self.critic_optimizer.zero_grad()
-                values = self.critic(batch_states, batch_temporal).squeeze()
+                values = self.critic(batch_states, batch_temporal).squeeze(-1)
 
                 # Simple MSE loss (no clipping - allows critic to adapt quickly)
-                critic_loss = 0.5 * torch.mean((batch_returns - values) ** 2)
+                critic_loss = self.value_coef * torch.mean((batch_returns - values) ** 2)
 
                 # Backward pass and update critic
                 critic_loss.backward()
@@ -502,7 +593,7 @@ class PPOStrategyV2(MLStrategy):
             # Early stopping on KL divergence
             avg_kl = epoch_kl / max(1, n_batches)
             if avg_kl > self.target_kl:
-                print(f"  [RL] Early stop epoch {epoch}, KL={avg_kl:.4f}")
+                logger.info(f"[RL] Early stop epoch {epoch}, KL={avg_kl:.4f}")
                 break
 
         # Clear buffer after update
@@ -516,7 +607,9 @@ class PPOStrategyV2(MLStrategy):
             1 - np.var(y_true - y_pred) / (var_y + 1e-8) if var_y > 0 else 0.0
         )
 
-        return {
+
+        # Prepare return metrics
+        metrics = {
             "policy_loss": np.mean(all_metrics["policy_loss"]),
             "value_loss": np.mean(all_metrics["value_loss"]),
             "entropy": np.mean(all_metrics["entropy"]),
@@ -525,16 +618,32 @@ class PPOStrategyV2(MLStrategy):
             "explained_variance": explained_var,
         }
 
+        # Print training summary
+        # print(f"{'='*60}")
+        # print(f"  TRAINING COMPLETE")
+        # print(f"  Policy Loss:     {metrics['policy_loss']:>8.4f}")
+        # print(f"  Value Loss:      {metrics['value_loss']:>8.4f}")
+        # print(f"  Entropy:         {metrics['entropy']:>8.4f}")
+        # print(f"  KL Divergence:   {metrics['approx_kl']:>8.4f}")
+        # print(f"  Clip Fraction:   {metrics['clip_fraction']:>8.4f}")
+        # print(f"  Explained Var:   {metrics['explained_variance']:>8.4f}")
+        # print(f"{'='*60}\n")
+
+        return metrics
+
     def reset(self):
-        """Clear experience buffer and state history."""
+        """Clear experience buffer and state history for new episode."""
         self.experiences.clear()
         self._state_history.clear()
         self._last_temporal_state = None
+        self._last_features_with_action = None
+        self._last_log_prob = 0.0
+        self._last_value = 0.0
+        self._previous_action = 1  # Reset to HOLD
 
     def save(self, path: str):
         """Save model and training state."""
-        # Convert path to .pth if needed
-        weights_path = path.replace(".npz", "") + ".pth"
+        weights_path = str(Path(path).with_suffix(".pth"))
 
         # Save complete checkpoint with PyTorch
         checkpoint = {
@@ -556,8 +665,7 @@ class PPOStrategyV2(MLStrategy):
 
     def load(self, path: str):
         """Load model and training state."""
-        # Convert path to .pth if needed
-        weights_path = path.replace(".npz", "") + ".pth"
+        weights_path = str(Path(path).with_suffix(".pth"))
 
         # Load checkpoint
         checkpoint = torch.load(weights_path, map_location=self.device)
@@ -573,6 +681,13 @@ class PPOStrategyV2(MLStrategy):
         # Load reward scaling
         self.reward_scale = float(checkpoint.get('reward_scale', 0.1))
 
-        # Set models to appropriate mode
+        # Move to device and restore train mode (load_state_dict preserves the saved
+        # training flag, which may differ from our intended mode)
         self.actor.to(self.device)
         self.critic.to(self.device)
+        if self.training:
+            self.actor.train()
+            self.critic.train()
+        else:
+            self.actor.eval()
+            self.critic.eval()

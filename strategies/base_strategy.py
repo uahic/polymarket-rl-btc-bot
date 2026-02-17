@@ -33,7 +33,7 @@ class BaseStrategy(ABC):
         """Select action given current state."""
         pass
 
-    def reset(self):
+    def reset(self) -> None:
         """Reset any internal state (called between episodes/markets)."""
         pass
 

@@ -3,6 +3,7 @@ Training logger for RL experiments.
 Logs trades, PPO updates, and episode summaries to CSV files.
 """
 import csv
+import logging
 import os
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -89,9 +90,10 @@ class TrainingLogger:
         # Write headers
         self._write_headers()
 
-        print(f"  [LOG] Session: {self.session_id}")
-        print(f"  [LOG] Trades:  {self.trades_file}")
-        print(f"  [LOG] Updates: {self.updates_file}")
+        self._logger = logging.getLogger(__name__)
+        self._logger.info(f"[LOG] Session: {self.session_id}")
+        self._logger.info(f"[LOG] Trades:  {self.trades_file}")
+        self._logger.info(f"[LOG] Updates: {self.updates_file}")
 
     def _write_headers(self):
         """Write CSV headers."""

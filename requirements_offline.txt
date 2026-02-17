@@ -1,0 +1,21 @@
+# Requirements for offline training architecture
+# Install with: pip install -r requirements_offline.txt
+
+# Core ML/RL libraries
+torch>=2.0.0
+numpy>=1.24.0
+gymnasium>=0.29.0  # OpenAI Gym successor
+
+# Data handling
+pandas>=2.0.0
+pyarrow>=12.0.0  # For parquet files
+
+# Optional but recommended
+matplotlib>=3.7.0  # For plotting training curves
+tensorboard>=2.13.0  # For training monitoring
+
+# Note: Your existing bot likely already has these installed:
+# - requests (for API calls)
+# - websockets (for streaming)
+# - py_clob_client (for Polymarket)
+# - eth-account (for signing)

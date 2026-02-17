@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -8,28 +9,30 @@ from logger.colors import Colors
 from security.key_store import EncryptedKeyStore, CryptoError, InvalidPasswordError
 from config import Config
 
+logger = logging.getLogger(__name__)
+
 
 def print_header(title: str) -> None:
     """Print a section header."""
-    print(f"\n{Colors.BOLD}{Colors.BLUE}{'=' * 50}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.BLUE}{title:^50}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.BLUE}{'=' * 50}{Colors.RESET}\n")
+    logger.info(f"\n{Colors.BOLD}{Colors.BLUE}{'=' * 50}{Colors.RESET}")
+    logger.info(f"{Colors.BOLD}{Colors.BLUE}{title:^50}{Colors.RESET}")
+    logger.info(f"{Colors.BOLD}{Colors.BLUE}{'=' * 50}{Colors.RESET}\n")
 
 
 def print_success(msg: str) -> None:
-    print(f"{Colors.GREEN}✓{Colors.RESET} {msg}")
+    logger.info(f"{Colors.GREEN}✓{Colors.RESET} {msg}")
 
 
 def print_error(msg: str) -> None:
-    print(f"{Colors.RED}✗{Colors.RESET} {msg}")
+    logger.info(f"{Colors.RED}✗{Colors.RESET} {msg}")
 
 
 def load_config() -> Config:
     """Load configuration from config.yaml."""
     if not os.path.exists("config.yaml"):
         print_error("config.yaml not found!")
-        print("\nPlease run the setup first:")
-        print(f"  {Colors.CYAN}python scripts/setup.py{Colors.RESET}")
+        logger.info("\nPlease run the setup first:")
+        logger.info(f"  {Colors.CYAN}python scripts/setup.py{Colors.RESET}")
         sys.exit(1)
 
     try:
@@ -39,7 +42,7 @@ def load_config() -> Config:
         if errors:
             print_error("Configuration validation failed:")
             for error in errors:
-                print(f"  - {error}")
+                logger.info(f"  - {error}")
             sys.exit(1)
 
         return config
@@ -65,7 +68,7 @@ def load_config_from_env() -> Config:
     if errors:
         print_error("Configuration validation failed:")
         for error in errors:
-            print(f"  - {error}")
+            logger.info(f"  - {error}")
         sys.exit(1)
 
     return config
@@ -77,11 +80,11 @@ def decrypt_private_key() -> str:
 
     if not os.path.exists(key_path):
         print_error("Encrypted key not found!")
-        print("\nPlease run the setup first:")
-        print(f"  {Colors.CYAN}python scripts/setup.py{Colors.RESET}")
+        logger.info("\nPlease run the setup first:")
+        logger.info(f"  {Colors.CYAN}python scripts/setup.py{Colors.RESET}")
         sys.exit(1)
 
-    print(f"{Colors.BOLD}Enter decryption password:{Colors.RESET}")
+    logger.info(f"{Colors.BOLD}Enter decryption password:{Colors.RESET}")
 
     while True:
         password = getpass("Password: ")
