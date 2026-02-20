@@ -8,6 +8,11 @@ import websockets
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Callable, Optional
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 CLOB_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -73,8 +78,8 @@ class OrderbookStreamer:
             self._pending_subs.append(token_down)
             added.append("DOWN")
 
-        if added:
-            logger.debug(f"  [OB] Queued {condition_id[:8]}... ({', '.join(added)}) - pending: {len(self._pending_subs)}")
+        # if added:
+        #     logger.debug(f"  [OB] Queued {condition_id[:8]}... ({', '.join(added)}) - pending: {len(self._pending_subs)}")
 
         # Initialize orderbook states
         self.orderbooks[f"{condition_id}_UP"] = OrderbookState(
@@ -103,7 +108,6 @@ class OrderbookStreamer:
             del self.orderbooks[k]
 
         # Also clean up subscriptions list
-        old_sub_count = len(self._subscriptions)
         self._subscriptions = [(cid, tid, side) for cid, tid, side in self._subscriptions
                                if cid in active_condition_ids]
 
@@ -130,7 +134,7 @@ class OrderbookStreamer:
         ob_up = self.get_orderbook(condition_id, "UP")
         ob_down = self.get_orderbook(condition_id, "DOWN")
 
-        if not ob_up or not ob_down:
+        if not ob_up or not ob_down or not ob_up.bids or not ob_up.asks:
             return {
                 "best_bid": 0.5,
                 "best_ask": 0.5,
@@ -138,20 +142,7 @@ class OrderbookStreamer:
                 "mid_price": 0.5,
                 "bids_l5": [],
                 "asks_l5": [],
-                "order_book_imbalance_l1": 0.0,
-                "order_book_imbalance_l5": 0.0,
             }
-
-        # Compute L1 and L5 imbalances
-        def compute_imbalance(bids, asks, depth=1):
-            """Compute order book imbalance: (bid_vol - ask_vol) / (bid_vol + ask_vol)"""
-            bid_vol = sum(size for _, size in bids[:depth])
-            ask_vol = sum(size for _, size in asks[:depth])
-            total_vol = bid_vol + ask_vol
-            return (bid_vol - ask_vol) / total_vol if total_vol > 0 else 0.0
-
-        imbalance_l1 = compute_imbalance(ob_up.bids, ob_up.asks, depth=1)
-        imbalance_l5 = compute_imbalance(ob_up.bids, ob_up.asks, depth=5)
 
         return {
             "best_bid": ob_up.best_bid,
@@ -160,8 +151,6 @@ class OrderbookStreamer:
             "mid_price": ob_up.mid_price,
             "bids_l5": ob_up.bids[:5],
             "asks_l5": ob_up.asks[:5],
-            "order_book_imbalance_l1": imbalance_l1,
-            "order_book_imbalance_l5": imbalance_l5,
         }
 
     async def stream(self):
@@ -247,28 +236,60 @@ class OrderbookStreamer:
     def _handle_book_update(self, data: dict):
         """Handle orderbook update message."""
         asset_id = data.get("asset_id")
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
 
-        # Find matching orderbook
-        for key, ob in self.orderbooks.items():
-            if ob.token_id == asset_id:
-                # Parse and sort: bids descending, asks ascending
-                parsed_bids = [(float(b["price"]), float(b["size"])) for b in bids]
-                parsed_asks = [(float(a["price"]), float(a["size"])) for a in asks]
+        ob = next((ob for ob in self.orderbooks.values() if ob.token_id == asset_id), None)
+        if ob is None:
+            return
 
-                # Sort bids high to low, asks low to high
-                ob.bids = sorted(parsed_bids, key=lambda x: x[0], reverse=True)[:10]
-                ob.asks = sorted(parsed_asks, key=lambda x: x[0])[:10]
-                ob.last_update = datetime.now(timezone.utc)
+        def merge_side(existing: list, updates: list, descending: bool) -> list:
+            # Start from the current book so we preserve levels not mentioned in this update.
+            # Polymarket sends incremental diffs: size=0 means the level was removed,
+            # any other size replaces the existing quantity at that price.
+            book = dict(existing)
+            for entry in updates:
+                price, size = float(entry["price"]), float(entry["size"])
+                if size == 0:
+                    # Remove price level if not present in the new data
+                    book.pop(price, None)
+                else:
+                    # Upsert new price/size pair
+                    book[price] = size
+            return sorted(book.items(), key=lambda x: x[0], reverse=descending)[:10]
 
-                # Call callbacks
-                for cb in self.callbacks:
-                    try:
-                        cb(ob)
-                    except:
-                        pass
-                break
+        if "bids" in data:
+            # Merge/Update new bid data from data object with existing object for orderbook
+            ob.bids = merge_side(ob.bids, data["bids"], descending=True)
+        if "asks" in data:
+            # Merge/Update new ask data from data object with existing object for orderbook
+            ob.asks = merge_side(ob.asks, data["asks"], descending=False)
+
+        # Bids and asks arrive in separate messages, so after updating one side the book
+        # can temporarily appear crossed (best_bid >= best_ask) due to the other side
+        # being stale. Strip any levels that violate the invariant using the current
+        # best prices as the boundary before notifying callbacks.
+
+        # Yes, that's exactly what a crossed book is — and it's valid in real markets. 
+        # Someone can place a bid higher than an existing ask. But on Polymarket's CLOB,#
+        # this shouldn't persist because the exchange matches orders immediately when they cross. 
+        # A bid at 0.75 against an ask at 0.72 would be filled at the ask price before either side 
+        # ever appears in the orderbook snapshot you receive. So if you're seeing crossed levels in the feed, it's one of:
+        # 1. Stale data — the case we already fixed, where bid and ask updates arrive in separate messages
+        # 2. Feed inconsistency — a race between the match engine and the WebSocket broadcast, resolved within milliseconds
+        # 3. Bug in the exchange feed — unlikely but possible
+
+        if ob.bids and ob.asks:
+            # Sort out crossed book entries
+            best_bid, best_ask = ob.bids[0][0], ob.asks[0][0]
+            ob.bids = [(p, s) for p, s in ob.bids if p < best_ask]
+            ob.asks = [(p, s) for p, s in ob.asks if p > best_bid]
+
+        ob.last_update = datetime.now(timezone.utc)
+
+        for cb in self.callbacks:
+            try:
+                cb(ob)
+            except:
+                pass
 
     def _handle_price_change(self, data: dict):
         """Handle price change message (simpler update)."""
@@ -289,20 +310,25 @@ class OrderbookStreamer:
 
 
 if __name__ == "__main__":
+    # logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(message)s")
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(message)s")
+    logging.getLogger("__main__").setLevel(logging.DEBUG)
+
+
     # Test with a real market
-    from polymarket_api import get_active_markets
+    from polymarket_api import get_15m_markets
 
     logger.info("Testing Orderbook WSS...")
 
     async def test():
-        markets = get_active_markets()
+        markets = get_15m_markets(['BTC'])
 
         if not markets:
             logger.warning("No active markets!")
             return
 
         m = markets[0]
-        logger.info(f"Subscribing to: {m.question[:50]}...")
+        logger.info(f"Subscribing to: {m.description}...")
 
         streamer = OrderbookStreamer()
         streamer.subscribe(m.condition_id, m.token_up, m.token_down)

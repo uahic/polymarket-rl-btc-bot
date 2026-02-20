@@ -14,6 +14,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+from features.orderbook_utils import compute_orderbook_imbalance_l1, compute_orderbook_imbalance_l5
 
 
 @dataclass
@@ -171,8 +172,8 @@ class FeatureComputer:
         """
 
         # Compute derived features
-        ob_imbalance_l1 = self._compute_orderbook_imbalance_l1(raw_data.orderbook)
-        ob_imbalance_l5 = self._compute_orderbook_imbalance_l5(raw_data.orderbook)
+        ob_imbalance_l1 = compute_orderbook_imbalance_l1(raw_data.orderbook.bids_l5, raw_data.orderbook.asks_l5) # l1 be filtered out
+        ob_imbalance_l5 = compute_orderbook_imbalance_l5(raw_data.orderbook.bids_l5, raw_data.orderbook.asks_l5)
         spread_pct = self._compute_spread_pct(raw_data.orderbook, raw_data.prob_up)
         velocity = self._compute_velocity(raw_data.prob_history, raw_data.prob_up, window=3)
         vol_5m = self._compute_volatility(raw_data.prob_history, window=30)
@@ -229,44 +230,6 @@ class FeatureComputer:
 
         return f.copy()
 
-    def _compute_orderbook_imbalance_l1(self, orderbook: OrderbookSnapshot) -> float:
-        """
-        Compute L1 orderbook imbalance (top of book).
-
-        Imbalance = (bid_size - ask_size) / (bid_size + ask_size)
-        Range: [-1, 1]
-        """
-        if not orderbook.bids_l5 or not orderbook.asks_l5:
-            return 0.0
-
-        bid_size = orderbook.bids_l5[0][1]  # Best bid size
-        ask_size = orderbook.asks_l5[0][1]  # Best ask size
-
-        total = bid_size + ask_size
-        if total == 0:
-            return 0.0
-
-        return (bid_size - ask_size) / total
-
-    def _compute_orderbook_imbalance_l5(self, orderbook: OrderbookSnapshot) -> float:
-        """
-        Compute L5 orderbook imbalance (depth).
-
-        Sums top 5 levels on each side.
-        Range: [-1, 1]
-        """
-        if not orderbook.bids_l5 or not orderbook.asks_l5:
-            return 0.0
-
-        bid_depth = sum(size for _, size in orderbook.bids_l5[:5])
-        ask_depth = sum(size for _, size in orderbook.asks_l5[:5])
-
-        total = bid_depth + ask_depth
-        if total == 0:
-            return 0.0
-
-        return (bid_depth - ask_depth) / total
-
     def _compute_spread_pct(self, orderbook: OrderbookSnapshot, prob: float) -> float:
         """
         Compute spread as percentage of price.
@@ -314,70 +277,3 @@ class FeatureComputer:
         recent = prob_history[-window:]
         return float(np.std(recent))
 
-
-# Backwards compatibility: allow importing from structures/market.py
-def compute_features_from_market_state(market_state: Any) -> np.ndarray:
-    """
-    Compatibility wrapper for existing MarketState objects.
-
-    This allows gradual migration from MarketState.to_features()
-    to the new FeatureComputer.
-    """
-    # Extract raw data from MarketState
-    raw_data = RawMarketData(
-        timestamp=0.0,  # Not stored in MarketState
-        asset=market_state.asset,
-        orderbook=OrderbookSnapshot(
-            timestamp=0.0,
-            best_bid=market_state.best_bid,
-            best_ask=market_state.best_ask,
-            spread=market_state.spread,
-            bids_l5=[],  # Would need to be populated
-            asks_l5=[],
-        ),
-        futures=FuturesData(
-            timestamp=0.0,
-            price=market_state.binance_price,
-            returns_1m=market_state.returns_1m,
-            returns_5m=market_state.returns_5m,
-            returns_10m=market_state.returns_10m,
-            cvd=market_state.cvd,
-            cvd_history=[market_state.prev_cvd, market_state.cvd],
-            trade_flow_imbalance=market_state.trade_flow_imbalance,
-            trade_intensity=market_state.trade_intensity,
-            large_trade_flag=market_state.large_trade_flag,
-            realized_vol_5m=market_state.realized_vol_5m,
-            avg_vol=market_state.realized_vol_5m / max(0.001, market_state.vol_expansion)
-                    if market_state.vol_expansion > 0 else market_state.realized_vol_5m,
-        ),
-        spot=SpotData(
-            timestamp=0.0,
-            price=market_state.binance_price,
-            change_pct=market_state.binance_change,
-        ),
-        prob_up=market_state.prob,
-        time_remaining=market_state.time_remaining,
-        prob_history=market_state.prob_history,
-        vol_regime=market_state.vol_regime,
-        trend_regime=market_state.trend_regime,
-    )
-
-    position = PositionState(
-        has_position=market_state.has_position,
-        side=market_state.position_side,
-        unrealized_pnl=market_state.position_pnl,
-        time_remaining_normalized=market_state.time_remaining,
-    )
-
-    transaction = TransactionState(
-        pending_order=(market_state.last_action_status == "pending"),
-        failed_order=(market_state.last_action_status == "failed"),
-        consecutive_failures=market_state.consecutive_failures,
-    )
-
-    capital = CapitalState(
-        available_balance=market_state.available_balance,
-    )
-
-    computer = FeatureComputer()
-    return computer.compute_features(raw_data, position, transaction, capital)

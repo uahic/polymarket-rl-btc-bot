@@ -3,6 +3,9 @@ import os
 import sys
 from pathlib import Path
 from getpass import getpass
+from typing import Any, Dict
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from logger.colors import Colors
@@ -72,6 +75,21 @@ def load_config_from_env() -> Config:
         sys.exit(1)
 
     return config
+
+
+_RUNNER_CONFIG_PATH = Path(__file__).parent / "config" / "trading_runner_config.yaml"
+
+
+def load_runner_config() -> Dict[str, Any]:
+    """Load trading runner config from yaml, falling back to empty dict on missing file."""
+    try:
+        with open(_RUNNER_CONFIG_PATH) as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        logger.warning(
+            f"trading_runner_config.yaml not found at {_RUNNER_CONFIG_PATH}, using defaults"
+        )
+        return {}
 
 
 def decrypt_private_key() -> str:

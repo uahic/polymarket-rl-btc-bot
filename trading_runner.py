@@ -15,13 +15,10 @@ Usage:
     python run_gym.py btc_ppo --paper --train
 """
 
-
-
 import asyncio
 import logging
 import time
-from typing import Callable, Dict, Optional, List
-from dataclasses import dataclass
+from typing import Callable, Dict, Any, List
 
 # Environment imports
 from environments.trading_gym import TradingGym
@@ -31,37 +28,85 @@ from executors.live_executor import LiveOrderExecutor
 from executors.executor_wrapper import GymExecutorWrapper
 
 # Strategy imports
+from structures.market import MarketInfo
 from structures.action import Action
 from strategies.base_strategy import BaseStrategy
+from strategies.ml_base_strategy import MLStrategy
 
 # Stream imports
 from streams.orderbook import OrderbookStreamer
 from streams.binance import BinanceStreamer
 from streams.binance_futures import FuturesStreamer
+from streams.polymarket_api import get_15m_markets
 
 # Logging
 from logger.colors import Colors
 
 # Config
-from config_loader import Config
+from config_loader import Config, load_runner_config
+
+_runner_cfg = load_runner_config()
+_rcfg_runner = _runner_cfg.get("runner", {})
+_rcfg_env = _runner_cfg.get("environment", {})
+_rcfg_streams = _runner_cfg.get("streams", {})
+_rcfg_loop = _runner_cfg.get("loop", {})
+_rcfg_logging = _runner_cfg.get("logging", {})
 
 logger = logging.getLogger(__name__)
 
-action_color_dict ={
+action_color_dict = {
     Action.BUY: f"{Colors.BOLD}{Colors.GREEN}BUY{Colors.RESET}",
     Action.HOLD: f"{Colors.BOLD}{Colors.BLUE}HOLD{Colors.RESET}",
-    Action.SELL: f"{Colors.BOLD}{Colors.RED}RED{Colors.RESET}"
+    Action.SELL: f"{Colors.BOLD}{Colors.RED}SELL{Colors.RESET}",
 }
 
-@dataclass
-class MarketInfo:
-    """Information about an active Polymarket market."""
-    condition_id: str
-    asset: str
-    token_up: str
-    token_down: str
-    expiry: float
-    description: str
+
+def log_run_episode(
+    step_count, action: Action, prev_pnl, reward, info: Dict[str, Any]
+) -> None:
+    current_pnl = info.get("unrealized_pnl", 0)
+    delta_pnl = current_pnl - prev_pnl
+    amount_spent = info.get("amount_spent", 0)
+    realized_pnl = info.get("pnl", 0)
+    has_position = info.get("has_position", False)
+    position_side = info.get("position_side", None)
+
+    # Build log message
+    log_msg = (
+        f"Step {step_count:4d} | "
+        f"Action: {action_color_dict[action]:4s} | "
+        f"Reward: {reward:+.4f} | "
+        f"Balance: ${info.get('balance', 0):.2f}"
+    )
+
+    # Add position info
+    if has_position:
+        log_msg += f" | Pos: {position_side} | UPnL: ${current_pnl:+.2f} | Δ: ${delta_pnl:+.2f}"
+    else:
+        log_msg += f" | Pos: FLAT"
+
+    # Add trade info (distinguish between open, close, and hold)
+    rejection_reason = info.get("rejection_reason", "") or ""
+    if action.name == "HOLD":
+        # HOLD action - no trade expected
+        pass
+    elif "redundant" in rejection_reason:
+        # Redundant same-direction order
+        log_msg += f" | 🚫 REDUNDANT {action.name} | Penalty: ${realized_pnl:+.2f}"
+    elif realized_pnl != 0 and amount_spent > 0:
+        # Closed old position AND opened new one (switched positions)
+        log_msg += f" | 🔄 SWITCHED | Realized: ${realized_pnl:+.2f} | Spent: ${amount_spent:.2f}"
+    elif realized_pnl != 0:
+        # Just closed position
+        log_msg += f" | ✓ CLOSED | Realized: ${realized_pnl:+.2f}"
+    elif amount_spent > 0 and info.get("filled", False):
+        # Just opened position
+        log_msg += f" | ✓ OPENED | Spent: ${amount_spent:.2f}"
+    elif not info.get("filled", False):
+        # Trade was rejected
+        log_msg += f" | ❌ REJECTED: {rejection_reason}"
+
+    logger.info(log_msg)
 
 
 class GymTradingRunner:
@@ -78,11 +123,11 @@ class GymTradingRunner:
         self,
         strategy_factory: Callable,
         config: Config,
-        mode: str = "paper",  # "live" or "paper"
-        trade_size: float = 10.0,
+        mode: str = _rcfg_runner.get("mode", "paper"),
+        trade_size: float = _rcfg_runner.get("default_trade_size", 10.0),
         assets: List[str] = None,
-        max_episode_steps: int = 1800,
-        enable_dashboard: bool = False,
+        max_episode_steps: int = _rcfg_runner.get("max_episode_steps", 1800),
+        enable_dashboard: bool = _rcfg_runner.get("enable_dashboard", False),
     ):
         """
         Initialize gym trading runner.
@@ -100,7 +145,7 @@ class GymTradingRunner:
         self.config = config
         self.mode = mode
         self.trade_size = trade_size
-        self.assets = assets or ["BTC"]
+        self.assets = assets or _rcfg_runner.get("assets", ["BTC"])
         self.max_episode_steps = max_episode_steps
         self.enable_dashboard = enable_dashboard
 
@@ -122,7 +167,9 @@ class GymTradingRunner:
 
     async def run(self):
         """Start the trading runner."""
-        logger.info(f"GYM TRADING RUNNER | Mode: {self.mode.upper()} | Assets: {', '.join(self.assets)} | Trade size: ${self.trade_size:.2f}")
+        logger.info(
+            f"GYM TRADING RUNNER | Mode: {self.mode.upper()} | Assets: {', '.join(self.assets)} | Trade size: ${self.trade_size:.2f}"
+        )
 
         # Initialize streams
         logger.info("Initializing data streams...")
@@ -132,9 +179,9 @@ class GymTradingRunner:
 
         # Initialize CLOB client for live trading
         if self.mode == "live":
-            from py_clob_client.client import ClobClient
+            from transactions.async_client import AsyncClobClient
 
-            self.transaction_client = ClobClient(
+            self.transaction_client = AsyncClobClient(
                 host=self.config.clob_url,
                 key=self.config.private_key,
                 chain_id=self.config.chain_id,
@@ -155,14 +202,14 @@ class GymTradingRunner:
         """Main trading loop using gym environment."""
         # Wait for streams to initialize
         logger.info("Waiting for streams to initialize...")
-        await asyncio.sleep(3)
+        await asyncio.sleep(_rcfg_streams.get("init_wait_seconds", 3))
 
         # Create data source
         live_source = LiveSource(
             self.orderbook_streamer,
             self.binance_streamer,
             self.futures_streamer,
-            tick_interval=0.5,
+            tick_interval=_rcfg_streams.get("tick_interval", 0.5),
         )
 
         # Create feature computer
@@ -173,7 +220,7 @@ class GymTradingRunner:
         # Main loop: discover markets and trade
         while True:
             # Discover active markets
-            markets = await self._discover_markets()
+            markets = get_15m_markets(assets=self.assets)
 
             # Subscribe to orderbook streams for discovered markets first,
             # then clean up stale subscriptions. This order ensures the current
@@ -181,9 +228,7 @@ class GymTradingRunner:
             # cleanup runs, preventing a spurious reconnect at episode boundaries.
             for market in markets:
                 self.orderbook_streamer.subscribe(
-                    market.condition_id,
-                    market.token_up,
-                    market.token_down
+                    market.condition_id, market.token_up, market.token_down
                 )
 
             # Clean up stale orderbook subscriptions for expired markets
@@ -204,7 +249,7 @@ class GymTradingRunner:
                     executor = GymExecutorWrapper(default_order_size=self.trade_size)
 
                 # Set market context for executor
-                if hasattr(executor, 'set_market_context'):
+                if hasattr(executor, "set_market_context"):
                     executor.set_market_context(
                         market.condition_id,
                         market.token_up,
@@ -216,22 +261,29 @@ class GymTradingRunner:
                     data_source=live_source,
                     executor=executor,
                     feature_computer=feature_computer,
-                    initial_balance=1000.0 if self.mode == "paper" else 100.0,
+                    initial_balance=(
+                        _rcfg_env.get("paper_initial_balance", 1000.0)
+                        if self.mode == "paper"
+                        else _rcfg_env.get("live_initial_balance", 100.0)
+                    ),
                     max_episode_steps=self.max_episode_steps,
-                    shaping_reward_coef=0.01,
-                    normalize_rewards=True,
+                    shaping_reward_coef=_rcfg_env.get("shaping_reward_coef", 0.01),
+                    normalize_rewards=_rcfg_env.get("normalize_rewards", True),
                 )
 
                 # Get or create strategy for this asset
+                # _get_strategy calls the strategy_factory passed to this class instance
                 strategy = self._get_strategy(asset)
 
                 # Run episode for this market
                 await self._run_episode(env, strategy, market)
 
             # Wait before next market discovery
-            await asyncio.sleep(10)
+            await asyncio.sleep(_rcfg_loop.get("market_discovery_interval_seconds", 10))
 
-    async def _run_episode(self, env: TradingGym, strategy: BaseStrategy, market: MarketInfo):
+    async def _run_episode(
+        self, env: TradingGym, strategy: BaseStrategy, market: MarketInfo
+    ):
         """
         Run one episode (one market) using gym interface.
 
@@ -240,14 +292,18 @@ class GymTradingRunner:
             strategy: Strategy instance
             market: Market information
         """
-        logger.info(f"Starting episode: {market.asset} | Market: {market.description[:60]}... | ID: {market.condition_id} | Expiry: {time.strftime('%H:%M:%S', time.localtime(market.expiry))}")
+        logger.info(
+            f"Starting episode: {market.asset} | Market: {market.description[:60]}... | ID: {market.condition_id} | Expiry: {time.strftime('%H:%M:%S', time.localtime(market.expiry))}"
+        )
 
         # Reset environment and strategy
-        obs, info = env.reset(options={"asset": market.asset, "market_id": market.condition_id})
+        obs, info = env.reset(
+            options={"asset": market.asset, "market_id": market.condition_id}
+        )
         strategy.reset()
 
-        done = False
-        truncated = False
+        done = False  # Episode done?
+        truncated = False  # Episode truncated?
         step_count = 0
         episode_reward = 0.0
         # prev_obs = obs
@@ -265,12 +321,12 @@ class GymTradingRunner:
             next_obs, reward, done, truncated, info = await env.step(action)
 
             # RL training (if enabled)
-            if hasattr(strategy, 'store') and hasattr(strategy, 'training') and strategy.training:
+            if isinstance(strategy, MLStrategy) and strategy.training:
                 strategy.store(obs, action, reward, next_obs, done or truncated)
 
-                # Update (train) if buffer is full
-                if hasattr(strategy, 'should_update') and strategy.should_update():
-                    metrics = strategy.update() if hasattr(strategy, 'update') else None
+                # Train for 1 step
+                if strategy.should_update():
+                    metrics = strategy.update()
                     if metrics:
                         self._log_training_metrics(metrics)
 
@@ -283,11 +339,11 @@ class GymTradingRunner:
 
             # Track completed trades for dashboard
             # Log any trade execution (open or close)
-            if info.get('filled', False) or info.get('pnl', 0) != 0:
+            if info.get("filled", False) or info.get("pnl", 0) != 0:
                 # Count only closing trades for stats
-                if info.get('pnl', 0) != 0:
+                if info.get("pnl", 0) != 0:
                     episode_trades += 1
-                    if info.get('pnl', 0) > 0:
+                    if info.get("pnl", 0) > 0:
                         episode_wins += 1
 
                 # Log to dashboard
@@ -295,56 +351,17 @@ class GymTradingRunner:
                     self._update_dashboard_trade(info, market.asset)
 
             # Update dashboard with current PnL
-            if self.enable_dashboard and step_count % 10 == 0:
+            if (
+                self.enable_dashboard
+                and step_count % _rcfg_logging.get("dashboard_pnl_update_steps", 10)
+                == 0
+            ):
                 self._update_dashboard_pnl(info)
 
             # Logging
-            if step_count % 1 == 0:
-                current_pnl = info.get('unrealized_pnl', 0)
-                delta_pnl = current_pnl - prev_pnl
-                amount_spent = info.get('amount_spent', 0)
-                realized_pnl = info.get('pnl', 0)
-                has_position = info.get('has_position', False)
-                position_side = info.get('position_side', None)
-
-
-                # Build log message
-                log_msg = (
-                    f"Step {step_count:4d} | "
-                    f"Action: {action_color_dict[action]:4s} | "
-                    f"Reward: {reward:+.4f} | "
-                    f"Balance: ${info.get('balance', 0):.2f}"
-                )
-
-                # Add position info
-                if has_position:
-                    log_msg += f" | Pos: {position_side} | UPnL: ${current_pnl:+.2f} | Δ: ${delta_pnl:+.2f}"
-                else:
-                    log_msg += f" | Pos: FLAT"
-
-                # Add trade info (distinguish between open, close, and hold)
-                rejection_reason = info.get('rejection_reason', '') or ''
-                if action.name == 'HOLD':
-                    # HOLD action - no trade expected
-                    pass
-                elif 'redundant' in rejection_reason:
-                    # Redundant same-direction order
-                    log_msg += f" | 🚫 REDUNDANT {action.name} | Penalty: ${realized_pnl:+.2f}"
-                elif realized_pnl != 0 and amount_spent > 0:
-                    # Closed old position AND opened new one (switched positions)
-                    log_msg += f" | 🔄 SWITCHED | Realized: ${realized_pnl:+.2f} | Spent: ${amount_spent:.2f}"
-                elif realized_pnl != 0:
-                    # Just closed position
-                    log_msg += f" | ✓ CLOSED | Realized: ${realized_pnl:+.2f}"
-                elif amount_spent > 0 and info.get('filled', False):
-                    # Just opened position
-                    log_msg += f" | ✓ OPENED | Spent: ${amount_spent:.2f}"
-                elif not info.get('filled', False):
-                    # Trade was rejected
-                    log_msg += f" | ❌ REJECTED: {rejection_reason}"
-
-                logger.info(log_msg)
-                prev_pnl = current_pnl
+            if step_count % _rcfg_logging.get("log_frequency_steps", 1) == 0:
+                log_run_episode(step_count, action, prev_pnl, reward, info)
+                prev_pnl = info.get("unrealized_pnl", 0)
 
             obs = next_obs
 
@@ -366,56 +383,16 @@ class GymTradingRunner:
         if self.enable_dashboard:
             self._update_dashboard_episode(episode_reward, step_count)
 
-        logger.info(f"Episode complete: {market.asset} | Steps: {step_count} | Reward: {episode_reward:.4f} | Balance: ${final_balance:.2f} | PnL: ${final_pnl:+.2f} | Spent: ${total_spent:.2f} | Cumulative PnL: ${self.cumulative_pnl:+.2f}")
+        logger.info(
+            f"Episode complete: {market.asset} | Steps: {step_count} | Reward: {episode_reward:.4f} | Balance: ${final_balance:.2f} | PnL: ${final_pnl:+.2f} | Spent: ${total_spent:.2f} | Cumulative PnL: ${self.cumulative_pnl:+.2f}"
+        )
 
-    async def _discover_markets(self) -> List[MarketInfo]:
-        """
-        Discover active Polymarket markets for tracked assets.
-
-        Returns:
-            List of active markets ready to trade
-        """
-        # TODO: Implement market discovery via CLOB API
-        # For now, return mock data for testing
-
-        markets = []
-
-        # Calculate next 15-minute slot expiry
-        # This ensures the same expiry is used for the same 15-min period
-        current_time = time.time()
-        minutes_into_hour = int(time.localtime(current_time).tm_min)
-        next_slot = ((minutes_into_hour // 15) + 1) * 15
-
-        # Get current hour as timestamp
-        current_hour = time.mktime(time.localtime(current_time)[:4] + (0, 0, 0, 0, 0))
-
-        # Calculate expiry at the next 15-minute boundary
-        expiry = current_hour + (next_slot * 60)
-        if expiry <= current_time:
-            expiry += 900  # Add 15 minutes if we're exactly on a boundary
-
-        for asset in self.assets:
-            # Use expiry timestamp in condition_id to make it unique per slot
-            slot_id = int(expiry)
-            # Mock market for testing
-            markets.append(
-                MarketInfo(
-                    condition_id=f"{asset.lower()}_15m_{slot_id}",
-                    asset=asset,
-                    token_up=f"mock_token_up_{asset.lower()}",
-                    token_down=f"mock_token_down_{asset.lower()}",
-                    expiry=expiry,
-                    description=f"Will {asset} price go up in next 15 minutes?",
-                )
-            )
-
-        return markets
 
     def _get_strategy(self, asset: str):
         """Get or create strategy instance for asset."""
         if asset not in self.strategies:
             self.strategies[asset] = self.strategy_factory()
-            if hasattr(self.strategies[asset], 'reset'):
+            if hasattr(self.strategies[asset], "reset"):
                 self.strategies[asset].reset()
             logger.info(f"Created strategy instance for {asset}")
 
@@ -423,7 +400,9 @@ class GymTradingRunner:
 
     def _log_training_metrics(self, metrics: dict):
         """Log training metrics."""
-        logger.info(f"[Training] Policy Loss: {metrics.get('policy_loss', 0):.4f} | Value Loss: {metrics.get('value_loss', 0):.4f} | Entropy: {metrics.get('entropy', 0):.4f}")
+        logger.info(
+            f"[Training] Policy Loss: {metrics.get('policy_loss', 0):.4f} | Value Loss: {metrics.get('value_loss', 0):.4f} | Entropy: {metrics.get('entropy', 0):.4f}"
+        )
 
     def _update_dashboard_training(self, metrics: dict, strategy):
         """Update dashboard with training metrics."""
@@ -434,18 +413,20 @@ class GymTradingRunner:
             )
 
             update_training_metrics(
-                policy_loss=metrics.get('policy_loss'),
-                value_loss=metrics.get('value_loss'),
-                entropy=metrics.get('entropy'),
-                kl_divergence=metrics.get('approx_kl'),
-                clip_fraction=metrics.get('clip_fraction'),
-                explained_variance=metrics.get('explained_variance'),
+                policy_loss=metrics.get("policy_loss"),
+                value_loss=metrics.get("value_loss"),
+                entropy=metrics.get("entropy"),
+                kl_divergence=metrics.get("approx_kl"),
+                clip_fraction=metrics.get("clip_fraction"),
+                explained_variance=metrics.get("explained_variance"),
             )
 
             # Update buffer size
-            if hasattr(strategy, 'experiences'):
+            if hasattr(strategy, "experiences"):
                 buffer_size = len(strategy.experiences)
-                max_buffer = strategy.buffer_size if hasattr(strategy, 'buffer_size') else 256
+                max_buffer = (
+                    strategy.buffer_size if hasattr(strategy, "buffer_size") else 256
+                )
                 update_buffer_size(buffer_size, max_buffer)
 
         except Exception as e:
@@ -457,13 +438,13 @@ class GymTradingRunner:
         try:
             from dashboard.professional_dashboard import update_pnl
 
-            unrealized_pnl = info.get('unrealized_pnl', 0.0)
+            unrealized_pnl = info.get("unrealized_pnl", 0.0)
             realized_pnl = self.cumulative_pnl
 
             update_pnl(
                 total_pnl=realized_pnl + unrealized_pnl,
                 realized_pnl=realized_pnl,
-                unrealized_pnl=unrealized_pnl
+                unrealized_pnl=unrealized_pnl,
             )
         except Exception as e:
             pass
@@ -475,14 +456,14 @@ class GymTradingRunner:
             from datetime import datetime
 
             # Extract trade information
-            pnl = info.get('pnl', 0.0)
-            amount_spent = info.get('amount_spent', 0.0)
-            position_side = info.get('position_side', 'UNKNOWN')
-            filled = info.get('filled', False)
+            pnl = info.get("pnl", 0.0)
+            amount_spent = info.get("amount_spent", 0.0)
+            position_side = info.get("position_side", "UNKNOWN")
+            filled = info.get("filled", False)
 
             # Get prices if available
-            entry_price = info.get('entry_price', 0.5)
-            exit_price = info.get('exit_price', entry_price)
+            entry_price = info.get("entry_price", 0.5)
+            exit_price = info.get("exit_price", entry_price)
 
             # Only log if there's actual trade activity (open or close)
             if filled or pnl != 0:
@@ -490,13 +471,17 @@ class GymTradingRunner:
                 # For closing trades, pnl will be the realized profit/loss
                 log_trade(
                     asset=asset,
-                    side=position_side if position_side != 'UNKNOWN' else 'LONG',
+                    side=position_side if position_side != "UNKNOWN" else "LONG",
                     entry_price=entry_price,
                     exit_price=exit_price,
-                    size=amount_spent if amount_spent > 0 else abs(pnl) if pnl != 0 else 10.0,
+                    size=(
+                        amount_spent
+                        if amount_spent > 0
+                        else abs(pnl) if pnl != 0 else 10.0
+                    ),
                     pnl=pnl,
-                    duration_sec=info.get('trade_duration', 0),
-                    timestamp=datetime.now().strftime('%H:%M:%S')
+                    duration_sec=info.get("trade_duration", 0),
+                    timestamp=datetime.now().strftime("%H:%M:%S"),
                 )
         except Exception as e:
             # Silent fail - dashboard is optional
@@ -516,14 +501,14 @@ class GymTradingRunner:
             update_episode_metrics(
                 episode_count=self.episode_count,
                 avg_reward=avg_reward,
-                avg_length=step_count
+                avg_length=step_count,
             )
 
             # Update final PnL
             update_pnl(
                 total_pnl=self.cumulative_pnl,
                 realized_pnl=self.cumulative_pnl,
-                unrealized_pnl=0.0
+                unrealized_pnl=0.0,
             )
         except Exception as e:
             pass
@@ -557,7 +542,7 @@ async def main(args):
         config=args.config,
         mode=mode,
         trade_size=args.size,
-        assets=["BTC"],  # TODO: Make configurable
+        assets=_rcfg_runner.get("assets", ["BTC"]),
     )
 
     # Run
@@ -571,13 +556,16 @@ if __name__ == "__main__":
     from strategies import ALL_STRATEGIES
 
     parser = argparse.ArgumentParser(description="Gym-based Polymarket Trading")
-    parser.add_argument(
-        "strategy", choices=ALL_STRATEGIES, help="Strategy to run"
-    )
+    parser.add_argument("strategy", choices=ALL_STRATEGIES, help="Strategy to run")
     parser.add_argument(
         "--train", action="store_true", help="Enable training mode for RL"
     )
-    parser.add_argument("--size", type=float, default=10.0, help="Trade size in $")
+    parser.add_argument(
+        "--size",
+        type=float,
+        default=_rcfg_runner.get("default_trade_size", 10.0),
+        help="Trade size in $",
+    )
     parser.add_argument("--load", type=str, help="Load RL model from file")
     parser.add_argument("--live", action="store_true", help="Enable live trading mode")
 

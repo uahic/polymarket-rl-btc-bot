@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from environments.trading_gym import OrderExecutor, TradingAction, ExecutionResult
 from structures.action import Action
+from structures.position import ExtendedPosition
 from features.computer import (
     PositionState,
     TransactionState,
@@ -20,44 +21,6 @@ from features.computer import (
 )
 from py_clob_client.clob_types import OrderArgs, CreateOrderOptions
 from py_clob_client.order_builder.constants import BUY as ORDER_BUY, SELL as ORDER_SELL
-
-
-@dataclass
-class Position:
-    """Tracks current open position."""
-    side: str  # "UP" or "DOWN"
-    entry_price: float
-    shares: float
-    asset: str
-    token_id: str
-    condition_id: str
-    entry_time: float
-
-    @property
-    def entry_value(self) -> float:
-        return self.entry_price * self.shares
-
-    def compute_pnl(self, current_price: float) -> float:
-        """
-        Compute unrealized P&L.
-
-        For Polymarket:
-        - UP token: profit when price increases
-        - DOWN token: profit when price decreases (inverse)
-
-        Args:
-            current_price: Current UP token probability (prob_up)
-        """
-        if self.side == "UP":
-            current_value = current_price * self.shares
-            return current_value - self.entry_value
-        else:  # DOWN
-            # DOWN token value is inverse
-            # When we bought DOWN, we paid (1 - up_prob) per share
-            # Current value is (1 - current_up_prob) per share
-            current_down_price = 1.0 - current_price
-            current_value = current_down_price * self.shares
-            return current_value - self.entry_value
 
 
 @dataclass
@@ -105,7 +68,7 @@ class LiveOrderExecutor(OrderExecutor):
 
         # State
         self.balance = 0.0
-        self.current_position: Optional[Position] = None
+        self.current_position: Optional[ExtendedPosition] = None
         self.pending_orders: Dict[asyncio.Task, PendingOrder] = {}
 
         # For tracking fills
@@ -358,7 +321,7 @@ class LiveOrderExecutor(OrderExecutor):
         )
 
         # Create position
-        self.current_position = Position(
+        self.current_position = ExtendedPosition(
             side=position_side,
             entry_price=price,
             shares=shares,
@@ -460,14 +423,14 @@ class LiveOrderExecutor(OrderExecutor):
     def get_transaction_state(self) -> TransactionState:
         """Return transaction status for features."""
         return TransactionState(
-            last_action_status=self.last_action_status,
+            pending_order=self.last_action_status == "pending" or len(self.pending_orders) > 0,
+            failed_order=self.last_action_status == "failed",
             consecutive_failures=self.consecutive_failures,
-            pending_orders=len(self.pending_orders),
         )
 
     def get_capital_state(self) -> CapitalState:
         """Return balance for features."""
         return CapitalState(
             available_balance=self.balance,
-            total_value=self.balance,  # TODO: Add position value
+            max_balance=self.balance,
         )

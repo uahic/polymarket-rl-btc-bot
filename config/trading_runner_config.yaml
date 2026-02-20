@@ -1,0 +1,40 @@
+# Trading runner parameters.
+# All magic numbers from trading_runner.py are consolidated here.
+
+runner:
+  # Assets to track and trade (e.g. ["BTC"], ["BTC", "ETH"])
+  assets: ["BTC"]
+  # Trading mode default: "paper" or "live"
+  mode: paper
+  # Default trade size in USD (overridable via --size CLI flag)
+  default_trade_size: 10.0
+  # Maximum steps per episode (1800 = 15 min at 500 ms ticks)
+  max_episode_steps: 1800
+  # Enable professional dashboard integration
+  enable_dashboard: false
+
+environment:
+  # Initial balance for paper trading (USD)
+  paper_initial_balance: 1000.0
+  # Initial balance for live trading (USD)
+  live_initial_balance: 100.0
+  # Coefficient for shaping reward term
+  shaping_reward_coef: 0.01
+  # Normalise rewards inside TradingGym
+  normalize_rewards: true
+
+streams:
+  # Seconds to wait for streams to initialise before starting the trading loop
+  init_wait_seconds: 8
+  # LiveSource tick interval in seconds
+  tick_interval: 0.5
+
+loop:
+  # Seconds to sleep between market-discovery rounds
+  market_discovery_interval_seconds: 10
+
+logging:
+  # Log a step summary every N steps (1 = every step)
+  log_frequency_steps: 1
+  # Update dashboard PnL every N steps
+  dashboard_pnl_update_steps: 10

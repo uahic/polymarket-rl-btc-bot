@@ -240,29 +240,47 @@ def _frozen_features(exps: List[ParsedExperience]) -> List[str]:
     return frozen
 
 
-def _render_frozen_warning(frozen: List[str], n_exps: int) -> str:
-    """Render a warning box listing features that never changed."""
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(s: str) -> int:
+    """Return the visible (non-ANSI) length of a string."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def _render_frozen_warning_lines(frozen: List[str], n_exps: int) -> List[str]:
+    """Return the warning box as a list of lines (not joined)."""
     if not frozen:
-        return ""
-    _BG_WARN  = "\033[43m"   # yellow background
+        return []
+    _BG_WARN  = "\033[43m"
     _FG_BLACK = "\033[30m"
-    width = 60
-    bar = "!" * width
-    lines = [
-        "",
-        col(bar, _BG_WARN, _FG_BLACK, _BOLD) if USE_COLOR else bar,
-        col(
-            f"  WARNING: {len(frozen)} feature(s) NEVER changed across {n_exps} experiences",
-            _BG_WARN, _FG_BLACK, _BOLD,
-        ) if USE_COLOR else f"  WARNING: {len(frozen)} feature(s) NEVER changed across {n_exps} experiences",
-        col(bar, _BG_WARN, _FG_BLACK, _BOLD) if USE_COLOR else bar,
-    ]
+    width = 36
+    bar_plain = "!" * width
+    title = f"  FROZEN ({len(frozen)}/{n_exps} exp)"
+    lines: List[str] = []
+    lines.append(col(bar_plain, _BG_WARN, _FG_BLACK, _BOLD) if USE_COLOR else bar_plain)
+    lines.append(col(f"{title:<{width}}", _BG_WARN, _FG_BLACK, _BOLD) if USE_COLOR else f"{title:<{width}}")
+    lines.append(col(bar_plain, _BG_WARN, _FG_BLACK, _BOLD) if USE_COLOR else bar_plain)
     for name in frozen:
-        lines.append(
-            col(f"  • {name}", _YELLOW, _BOLD) if USE_COLOR else f"  • {name}"
-        )
-    lines.append(col(bar, _BG_WARN, _FG_BLACK, _BOLD) if USE_COLOR else bar)
-    return "\n".join(lines)
+        entry = f"  • {name:<{width - 4}}"
+        lines.append(col(entry, _YELLOW, _BOLD) if USE_COLOR else entry)
+    lines.append(col(bar_plain, _BG_WARN, _FG_BLACK, _BOLD) if USE_COLOR else bar_plain)
+    return lines
+
+
+def _side_by_side(left_lines: List[str], right_lines: List[str], gap: int = 4) -> str:
+    """Merge two lists of lines side-by-side, padding the left to a fixed width."""
+    if not right_lines:
+        return "\n".join(left_lines)
+    left_width = max((_visible_len(l) for l in left_lines), default=0)
+    n = max(len(left_lines), len(right_lines))
+    result = []
+    for i in range(n):
+        left = left_lines[i] if i < len(left_lines) else ""
+        right = right_lines[i] if i < len(right_lines) else ""
+        pad = left_width - _visible_len(left) + gap
+        result.append(f"{left}{' ' * pad}{right}")
+    return "\n".join(result)
 
 
 def _render_experience(
@@ -296,10 +314,22 @@ def _render_experience(
         f"next_features ({len(exp.next_features)})  [Δ vs features]",
     )
 
-    parts = ["\n".join(header_lines + feat_lines + next_feat_lines)]
-    if frozen:
-        parts.append(_render_frozen_warning(frozen, total))
-    return "\n".join(parts)
+    frozen_lines = _render_frozen_warning_lines(frozen, total) if frozen else []
+
+    # Align the warning box to the right of next_features.
+    # next_feat_lines[0] is a "\n"-prefixed label — split it off so vertical
+    # alignment of the data rows matches the warning box rows.
+    if frozen_lines and next_feat_lines:
+        label_line = next_feat_lines[0]          # "\nheader..." line
+        data_lines = next_feat_lines[1:]         # sep + rows + sep
+        # Pad warning box with empty lines at top to align with data rows
+        warn_padded = [""] * (len(data_lines) - len(frozen_lines)) + frozen_lines \
+            if len(data_lines) > len(frozen_lines) else frozen_lines
+        composed_next = label_line + "\n" + _side_by_side(data_lines, warn_padded, gap=4)
+    else:
+        composed_next = "\n".join(next_feat_lines)
+
+    return "\n".join(header_lines + feat_lines) + "\n" + composed_next
 
 
 # ---------------------------------------------------------------------------

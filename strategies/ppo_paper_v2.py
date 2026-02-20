@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 class Experience:
     """Single experience tuple with temporal context."""
 
-    state: np.ndarray  # Current state features (29,) = 26 base features + 3 prev action one-hot
-    temporal_state: np.ndarray  # Stacked temporal features (history_len * 29,)
+    state: np.ndarray  # Current state features (25,) = 22 market features + 3 prev action one-hot
+    temporal_state: np.ndarray  # Stacked temporal features (history_len * 25,)
     action: int
     reward: float
     next_state: np.ndarray
@@ -39,7 +39,7 @@ class TemporalEncoder(nn.Module):
     Output: (batch, output_dim)  — last hidden state of the GRU
     """
 
-    def __init__(self, input_dim: int = 29, history_len: int = 5, output_dim: int = 32):
+    def __init__(self, input_dim: int = 25, history_len: int = 5, output_dim: int = 32):
         super().__init__()
         self.input_dim = input_dim
         self.history_len = history_len
@@ -65,7 +65,7 @@ class Actor(nn.Module):
     """Policy network with GRU-based temporal awareness.
 
     Architecture:
-        Current state (29) + GRU temporal features (32) = 61
+        Current state (25) + GRU temporal features (32) = 57
         → 64 → LayerNorm → tanh → 64 → LayerNorm → tanh → 3 (softmax)
 
     Temporal encoder is a GRU that processes the ordered state history,
@@ -75,7 +75,7 @@ class Actor(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 29,
+        input_dim: int = 25,
         hidden_size: int = 64,
         output_dim: int = 3,
         history_len: int = 5,
@@ -98,8 +98,8 @@ class Actor(nn.Module):
         """Forward pass. Returns action probabilities.
 
         Args:
-            current_state: (batch, 29) current features with previous action
-            temporal_state: (batch, history_len * 29) stacked history
+            current_state: (batch, 25) current features with previous action
+            temporal_state: (batch, history_len * 25) stacked history
         """
         # Encode temporal context via GRU (last hidden state)
         temporal_features = self.temporal_encoder(temporal_state)
@@ -118,7 +118,7 @@ class Critic(nn.Module):
     """Value network with GRU-based temporal awareness - ASYMMETRIC (larger than actor).
 
     Architecture:
-        Current state (29) + GRU temporal features (32) = 61
+        Current state (25) + GRU temporal features (32) = 57
         → 96 → LayerNorm → tanh → 96 → LayerNorm → tanh → 1
 
     Larger network (96 vs 64) because:
@@ -129,7 +129,7 @@ class Critic(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 29,
+        input_dim: int = 25,
         hidden_size: int = 96,
         history_len: int = 5,
         temporal_dim: int = 32,
@@ -151,8 +151,8 @@ class Critic(nn.Module):
         """Forward pass. Returns value estimate.
 
         Args:
-            current_state: (batch, 29) current features with previous action
-            temporal_state: (batch, history_len * 29) stacked history
+            current_state: (batch, 25) current features with previous action
+            temporal_state: (batch, history_len * 25) stacked history
         """
         # Encode temporal context via GRU (last hidden state)
         temporal_features = self.temporal_encoder(temporal_state)
@@ -171,22 +171,22 @@ class PPOStrategyV2(MLStrategy):
 
     Key features:
     - GRU temporal encoder: processes ordered state history, capturing velocity/acceleration
-    - Time-of-day encoding: 4 cyclical features (hour_sin/cos, dow_sin/cos) added to base features
+    - Time-of-day features FILTERED OUT in act() method (not used for decisions)
     - Asymmetric architecture: larger critic (96) for better value estimation
     - Low gamma (0.9): focuses on near-term rewards for 15-min horizon
     - Larger buffer (2048): diverse experiences for stable gradient updates
 
     Feature dimensions:
-      Base features:        26  (22 market + 4 time-of-day)
+      Market features:      22  (time-of-day features filtered out)
       + previous action:     3  (one-hot)
-      = input_dim:          29
+      = input_dim:          25
       Temporal (GRU out):   32
-      Combined:             61
+      Combined:             57
     """
 
     def __init__(
         self,
-        input_dim: int = 29,  # 26 base features (22 market + 4 time-of-day) + 3 prev action one-hot
+        input_dim: int = 25,  # 22 market features + 3 prev action one-hot (time-of-day filtered)
         hidden_size: int = 64,  # Actor hidden size
         critic_hidden_size: int = 96,  # Larger critic for better value estimation
         history_len: int = 5,  # Number of past states for temporal processing
@@ -246,10 +246,6 @@ class PPOStrategyV2(MLStrategy):
         # Shape: (history_len, input_dim). Written in-place; returned as a flat copy.
         self._temporal_buf = np.zeros((self.history_len, self.input_dim), dtype=np.float32)
 
-        # Fixed reward scaling (not adaptive normalization)
-        # Scale PnL to roughly [-1, 1] range for stability
-        self.reward_scale = 0.1  # Divide PnL by 10 (e.g., $10 -> 1.0)
-
         # For storing last action's log prob, value, and state
         self._last_log_prob = 0.0
         self._last_value = 0.0
@@ -273,16 +269,16 @@ class PPOStrategyV2(MLStrategy):
         """Append one-hot encoded previous action to features.
 
         Args:
-            features: Base features (26-dim: 22 market + 4 time-of-day)
+            features: Market features (22-dim, time-of-day already filtered)
 
         Returns:
-            Extended features (29-dim) = features + one-hot previous action
+            Extended features (25-dim) = features + one-hot previous action
         """
         # Create one-hot encoding of previous action
         prev_action_onehot = np.zeros(3, dtype=np.float32)
         prev_action_onehot[self._previous_action] = 1.0
 
-        # Concatenate: [26 features] + [3 action dims] = 29
+        # Concatenate: [22 features] + [3 action dims] = 25
         return np.concatenate([features, prev_action_onehot])
 
     def _get_temporal_state(self, current_features_with_action: np.ndarray) -> np.ndarray:
@@ -295,7 +291,7 @@ class PPOStrategyV2(MLStrategy):
         Uses a preallocated buffer to avoid per-step heap allocation.
 
         Args:
-            current_features_with_action: 29-dim features (26 base + 3 prev action)
+            current_features_with_action: 25-dim features (22 market + 3 prev action)
         """
         # Add current state to history
         self._state_history.append(current_features_with_action.copy())
@@ -321,10 +317,14 @@ class PPOStrategyV2(MLStrategy):
         Returns:
             Action index (0=BUY_UP, 1=HOLD, 2=SELL_DOWN)
         """
-        # Append previous action to features (26 -> 29)
-        features_with_action = self._append_previous_action(features)
+        # Filter out time-of-day features (last 4 dimensions: hour_sin, hour_cos, dow_sin, dow_cos)
+        # Keep only the 22 market features
+        market_features = features[:22]
 
-        # Get temporal state (stacked history of 29-dim states)
+        # Append previous action to features (22 -> 25)
+        features_with_action = self._append_previous_action(market_features)
+
+        # Get temporal state (stacked history of 25-dim states)
         temporal_state = self._get_temporal_state(features_with_action)
 
         # Inference on CPU — networks reside on CPU between training updates
@@ -367,10 +367,10 @@ class PPOStrategyV2(MLStrategy):
         """Store experience for training with temporal context.
 
         Args:
-            features: Current state features (26-dim: 22 market + 4 time-of-day)
+            features: Current state features (26-dim originally, but only 22 market features used)
             action: Action taken (Action enum)
             reward: Reward received
-            next_features: Next state features (26-dim: 22 market + 4 time-of-day)
+            next_features: Next state features (26-dim originally, but only 22 market features used)
             done: Whether episode ended
         """
         # Reward arrives already clipped to [-3, 3] (or raw -2.0 for redundant actions)
@@ -382,14 +382,14 @@ class PPOStrategyV2(MLStrategy):
         features_with_action = (
             self._last_features_with_action
             if self._last_features_with_action is not None
-            else self._append_previous_action(features)
+            else self._append_previous_action(features[:22])  # Filter time-of-day features
         )
 
-        # For next_features, append the action just taken (becomes the "previous action" at t+1)
+        # For next_features, filter time-of-day and append the action just taken
         action_idx = action.value
         next_action_onehot = np.zeros(3, dtype=np.float32)
         next_action_onehot[action_idx] = 1.0
-        next_features_with_action = np.concatenate([next_features, next_action_onehot])
+        next_features_with_action = np.concatenate([next_features[:22], next_action_onehot])
 
         # Compute next temporal state by peeking at history without mutating it.
         # _get_temporal_state() appends to _state_history; calling it here would corrupt the
@@ -471,13 +471,6 @@ class PPOStrategyV2(MLStrategy):
         # Move networks to training device (GPU if available) for batch training
         self.actor.to(self.device)
         self.critic.to(self.device)
-
-        # Print training indicator
-        # print(f"\n{'='*60}")
-        # print(f"  PPO TRAINING UPDATE")
-        # print(f"  Buffer: {len(self.experiences)}/{self.buffer_size} experiences")
-        # print(f"  Epochs: {self.n_epochs} | Batch Size: {self.batch_size}")
-        # print(f"{'='*60}\n")
 
         # Convert experiences to arrays (including temporal states)
         states = np.array([e.state for e in self.experiences], dtype=np.float32)
@@ -644,17 +637,6 @@ class PPOStrategyV2(MLStrategy):
             "explained_variance": explained_var,
         }
 
-        # Print training summary
-        # print(f"{'='*60}")
-        # print(f"  TRAINING COMPLETE")
-        # print(f"  Policy Loss:     {metrics['policy_loss']:>8.4f}")
-        # print(f"  Value Loss:      {metrics['value_loss']:>8.4f}")
-        # print(f"  Entropy:         {metrics['entropy']:>8.4f}")
-        # print(f"  KL Divergence:   {metrics['approx_kl']:>8.4f}")
-        # print(f"  Clip Fraction:   {metrics['clip_fraction']:>8.4f}")
-        # print(f"  Explained Var:   {metrics['explained_variance']:>8.4f}")
-        # print(f"{'='*60}\n")
-
         return metrics
 
     def reset(self):
@@ -678,7 +660,6 @@ class PPOStrategyV2(MLStrategy):
             'critic_state_dict': self.critic.state_dict(),
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-            'reward_scale': self.reward_scale,
             # Architecture params for reconstruction
             'input_dim': self.input_dim,
             'hidden_size': self.hidden_size,
@@ -704,9 +685,6 @@ class PPOStrategyV2(MLStrategy):
         # Load optimizer state
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-
-        # Load reward scaling
-        self.reward_scale = float(checkpoint.get('reward_scale', 0.1))
 
         # Keep on CPU for low-latency per-step inference; update() handles GPU transfer
         self.actor.to(self.cpu_device)

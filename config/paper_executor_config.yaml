@@ -1,0 +1,93 @@
+# Paper executor simulation parameters.
+# All magic numbers from paper_executor.py are consolidated here.
+
+executor:
+  # Starting capital in USDC
+  initial_balance: 1000.0
+
+  # Polymarket fee rate in basis points.
+  # Formula: fee(p) = p * (1 - p) * (fee_rate_bps / 10000)
+  # At p=0.50 and 625 bps this yields ~1.56% effective fee.
+  default_fee_rate_bps: 625
+
+spread:
+  # Spread ceiling used to normalize the spread penalty to [0, 1].
+  # Represents the spread at which liquidity is considered maximally degraded
+  # (e.g. near-expiry or highly illiquid markets on Polymarket).
+  near_expiry_spread: 0.05
+
+  # Typical baseline spread used to normalize slippage magnitude.
+  # A spread equal to this value gives spread_factor = 1.0 (no amplification).
+  standard_spread: 0.02
+
+  # Maximum random market-impact slippage in basis points applied on exit.
+  # Exit price = best_bid - uniform(0, max_exit_slippage_bps) / 10000 * spread_factor * size_factor
+  # At 10 bps with a standard spread this gives ~0.1% additional market impact.
+  max_exit_slippage_bps: 10.0
+
+  # Weight of spread on exit slippage magnitude (mirrors gtc.spread_slippage_weight).
+  exit_spread_slippage_weight: 0.5
+
+  # Weight of size on exit slippage magnitude (mirrors gtc.size_slippage_weight).
+  exit_size_slippage_weight: 0.3
+
+gtc:
+  # Base probability that a GTC order fills at all, before penalties.
+  base_fill_probability: 0.95
+
+  # Weight of the spread penalty on fill probability.
+  # fill_prob *= (1 - spread_fill_weight * spread_penalty)
+  spread_fill_weight: 0.3
+
+  # Cap on size_penalty value (prevents over-penalising very large orders).
+  size_penalty_cap: 0.5
+
+  # Dollar size at which size_penalty reaches its cap.
+  # size_penalty = min(size / size_penalty_threshold, size_penalty_cap)
+  size_penalty_threshold: 100.0
+
+  # Weight of the size penalty on fill probability.
+  # fill_prob *= (1 - size_fill_weight * size_penalty)
+  size_fill_weight: 0.2
+
+  # Typical order size used to normalise size_factor for slippage.
+  # size_factor = size / typical_order_size
+  typical_order_size: 50.0
+
+  # Maximum random slippage in basis points before order-book adjustments.
+  # Actual slippage = uniform(0, max_slippage_bps) * imbalance * spread * size multipliers.
+  max_slippage_bps: 30.0
+
+  # Weight of spread_factor on slippage magnitude.
+  # slippage_bps *= (1 + spread_slippage_weight * spread_factor)
+  spread_slippage_weight: 0.5
+
+  # Weight of size_factor on slippage magnitude.
+  # slippage_bps *= (1 + size_slippage_weight * size_factor)
+  size_slippage_weight: 0.3
+
+fok:
+  # Base probability that a FOK order fills immediately, before penalties.
+  # Lower than GTC because FOK requires instant full fill.
+  base_fill_probability: 0.80
+
+  # Weight of the spread penalty on FOK fill probability.
+  # fill_prob *= (1 - spread_fill_weight * spread_penalty)
+  spread_fill_weight: 0.4
+
+  # Cap on size_penalty value for FOK (higher than GTC — harder to fill large orders instantly).
+  size_penalty_cap: 0.6
+
+  # Dollar size at which FOK size_penalty reaches its cap.
+  size_penalty_threshold: 100.0
+
+  # Weight of the size penalty on FOK fill probability.
+  size_fill_weight: 0.3
+
+  # Coefficient scaling order_book_imbalance into an imbalance_penalty.
+  # imbalance_penalty = min(abs(imbalance) * imbalance_coefficient, 1.0)
+  imbalance_coefficient: 0.3
+
+  # Maximum random price improvement in basis points for FOK fills.
+  # fill_price = base_price * (1 - uniform(0, max_price_improvement_bps) / 10000)
+  max_price_improvement_bps: 5.0

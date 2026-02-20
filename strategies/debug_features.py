@@ -113,7 +113,8 @@ class DebugFeatures(MLStrategy):
 
     def act(self, features: np.ndarray) -> Action:
         logger.debug("Calling act()")
-        return Action.HOLD
+        action_idx = np.random.randint(0, 3)
+        return Action(action_idx)
 
     def store(
         self,

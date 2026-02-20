@@ -3,6 +3,18 @@ import numpy as np
 from typing import List, Optional
 from dataclasses import dataclass, field
 
+
+@dataclass
+class MarketInfo:
+    """Information about an active Polymarket market."""
+    condition_id: str
+    asset: str
+    token_up: str
+    token_down: str
+    expiry: float
+    description: str
+
+
 @dataclass
 class MarketState:
     """Rich market state for 15-min trading decisions."""

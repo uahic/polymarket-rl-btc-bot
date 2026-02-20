@@ -6,10 +6,16 @@ Gym environment interface, allowing seamless integration without
 changing the existing simulator code.
 """
 
+# import sys
+# from pathlib import Path
+# sys.path.insert(0, str(Path(__file__).parent.parent))
 from typing import Optional
-from executors.executor import SimulatedOrderExecutor as OldExecutor
+import numpy as np
+from executors.paper_executor import SimulatedOrderExecutor
+from executors.executor_config import load_executor_config as _load_executor_config
 from environments.trading_gym import OrderExecutor, TradingAction, ExecutionResult
 from structures.action import Action
+from structures.position import Position
 from features.computer import (
     PositionState,
     TransactionState,
@@ -17,39 +23,12 @@ from features.computer import (
     RawMarketData,
 )
 
-
-class Position:
-    """Tracks current open position."""
-
-    def __init__(self, side: str, entry_price: float, shares: float, asset: str):
-        self.side = side  # "UP" or "DOWN"
-        self.entry_price = entry_price
-        self.shares = shares
-        self.asset = asset
-        self.entry_value = entry_price * shares
-
-    def compute_pnl(self, current_price: float) -> float:
-        """
-        Compute unrealized P&L.
-
-        For Polymarket:
-        - UP token: profit when price increases
-        - DOWN token: profit when price decreases
-
-        Args:
-            current_price: Current UP token probability (prob_up)
-        """
-        if self.side == "UP":
-            # UP token value increases with probability
-            current_value = current_price * self.shares
-            return current_value - self.entry_value
-        else:  # DOWN
-            # DOWN token value is inverse
-            # When we bought DOWN, we paid (1 - up_prob) per share
-            # Current value is (1 - current_up_prob) per share
-            current_down_price = 1.0 - current_price
-            current_value = current_down_price * self.shares
-            return current_value - self.entry_value
+_cfg = _load_executor_config()
+_sp = _cfg.get("spread", {})
+_MAX_EXIT_SLIPPAGE_BPS: float = _sp.get("max_exit_slippage_bps", 10.0)
+_EXIT_SPREAD_SLIPPAGE_WEIGHT: float = _sp.get("exit_spread_slippage_weight", 0.5)
+_EXIT_SIZE_SLIPPAGE_WEIGHT: float = _sp.get("exit_size_slippage_weight", 0.3)
+_STANDARD_SPREAD: float = _sp.get("standard_spread", 0.02)
 
 
 class GymExecutorWrapper(OrderExecutor):
@@ -63,14 +42,14 @@ class GymExecutorWrapper(OrderExecutor):
     4. Provides state getters for FeatureComputer
     """
 
-    def __init__(self, default_order_size: float = 10.0):
+    def __init__(self, default_order_size: float = 1.0):
         """
         Initialize wrapper.
 
         Args:
             default_order_size: Default trade size in USD
         """
-        self.executor = OldExecutor()
+        self.executor = SimulatedOrderExecutor()
         self.default_order_size = default_order_size
 
         # Position tracking
@@ -80,11 +59,6 @@ class GymExecutorWrapper(OrderExecutor):
         self.pending_order = False
         self.failed_order = False
         self.consecutive_failures = 0
-        self.last_fill_result = None
-
-        # For time remaining calculation
-        self.position_entry_time = 0.0
-        self.episode_duration = 900.0  # 15 min
 
     def reset(self, balance: float):
         """Reset executor state for new episode."""
@@ -93,8 +67,6 @@ class GymExecutorWrapper(OrderExecutor):
         self.pending_order = False
         self.failed_order = False
         self.consecutive_failures = 0
-        self.last_fill_result = None
-        self.position_entry_time = 0.0
 
     def execute(self, action: TradingAction, market_data: RawMarketData) -> ExecutionResult:
         """
@@ -181,6 +153,8 @@ class GymExecutorWrapper(OrderExecutor):
 
         if result["filled"]:
             # Create position
+
+            # TODO Maybe get the number of shares directly from the executor
             shares = size / result["fill_price"]
             self.current_position = Position(
                 side="UP" if side == "BUY" else "DOWN",
@@ -188,16 +162,16 @@ class GymExecutorWrapper(OrderExecutor):
                 shares=shares,
                 asset=market_data.asset,
             )
-            self.position_entry_time = market_data.timestamp
             self.consecutive_failures = 0
 
+            fee = self.executor.calculate_fee_per_share(result["fill_price"]) * shares
             return ExecutionResult(
                 success=True,
                 filled=True,
                 balance=result["balance_remaining"],
                 position=self.current_position,
                 pnl=0.0,  # No realized PnL yet
-                fee=size * self.executor.calculate_fee_per_share(result["fill_price"]),
+                fee=fee,
                 slippage=result["slippage"],
                 amount_spent=size,
             )
@@ -231,19 +205,33 @@ class GymExecutorWrapper(OrderExecutor):
         if self.current_position is None:
             return self._create_hold_result()
 
+
         # Calculate exit price based on market conditions
         # When selling, we get the bid price (if UP) or 1-ask (if DOWN)
         if self.current_position.side == "UP":
             # Selling UP tokens - get bid price
             exit_price = market_data.orderbook.best_bid if market_data.orderbook.best_bid is not None else market_data.prob_up
             # Apply slippage (worse price when selling)
-            slippage = -0.0001 * market_data.orderbook.spread if market_data.orderbook.spread else -0.0001
-            exit_price = max(0.01, exit_price + slippage)
         else:  # DOWN
             # Selling DOWN tokens - get bid price for DOWN (which is 1 - ask_up)
             exit_price = (1 - market_data.orderbook.best_ask) if market_data.orderbook.best_ask is not None else (1 - market_data.prob_up)
-            slippage = -0.0001 * market_data.orderbook.spread if market_data.orderbook.spread else -0.0001
-            exit_price = max(0.01, exit_price + slippage)
+
+        # Market-impact slippage: mirrors entry model in paper_executor.
+        # spread_factor amplifies impact in illiquid markets; size_factor
+        # amplifies impact for larger positions.
+        effective_spread = market_data.orderbook.spread or _STANDARD_SPREAD
+        spread_factor = effective_spread / self.executor.standard_spread
+        exit_size = self.current_position.entry_value
+        size_factor = exit_size / self.executor.gtc_typical_order_size
+        slippage_bps = (
+            np.random.uniform(0, _MAX_EXIT_SLIPPAGE_BPS)
+            * (1 + _EXIT_SPREAD_SLIPPAGE_WEIGHT * spread_factor)
+            * (1 + _EXIT_SIZE_SLIPPAGE_WEIGHT * size_factor)
+        )
+        slippage = -(exit_price * slippage_bps / 10000)
+
+        # exit_price cant be zero
+        exit_price = max(0.01, exit_price + slippage)
 
         # Calculate proceeds from selling shares
         exit_value = exit_price * self.current_position.shares
@@ -258,9 +246,8 @@ class GymExecutorWrapper(OrderExecutor):
         # Realized P&L = net proceeds - what we originally paid
         pnl = net_proceeds - entry_value
 
-        # Add proceeds to balance
-        self.executor.balance += net_proceeds
-        self.executor.total_fees_paid += fee
+        # Add proceeds to balance via executor's public interface
+        self.executor.realize_pnl(net_proceeds, fee=fee)
 
         # Clear position
         self.current_position = None

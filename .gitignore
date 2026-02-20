@@ -35,6 +35,9 @@ htmlcov/
 *.swp
 *.swo
 
+# Models
+models/
+
 # Project secrets and generated config
 config.yaml
 credentials/

@@ -239,7 +239,24 @@ class TradingGym(gym.Env):
         if self.current_market_data is None:
             raise RuntimeError("Must call reset() before step()")
 
-        # Execute action
+        # Advance time FIRST to get fresh market data
+        has_more_data = await self.data_source.advance()
+        self.step_count += 1
+
+        # Check termination
+        terminated = self.data_source.is_done() or not has_more_data
+        truncated = self.step_count >= self.max_episode_steps
+
+        # Update market data BEFORE executing action (prevents stale data)
+        if not terminated and not truncated:
+            self.current_market_data = self.data_source.get_current()
+        else:
+            # Terminal state: refresh market data if available so PnL is accurate
+            latest = self.data_source.get_current()
+            if latest is not None:
+                self.current_market_data = latest
+
+        # Execute action with FRESH market data
         trading_action = TradingAction(action=action, size=1.0)
         result = self.executor.execute(trading_action, self.current_market_data)
 
@@ -253,23 +270,10 @@ class TradingGym(gym.Env):
         # Compute reward
         reward = self._compute_reward(result)
 
-        # Advance time
-        has_more_data = await self.data_source.advance()
-        self.step_count += 1
-
-        # Check termination
-        terminated = self.data_source.is_done() or not has_more_data
-        truncated = self.step_count >= self.max_episode_steps
-
-        # Get next observation
+        # Get observation for next step
         if not terminated and not truncated:
-            self.current_market_data = self.data_source.get_current()
             obs = self._get_observation()
         else:
-            # Terminal state: refresh market data if available so PnL is accurate
-            latest = self.data_source.get_current()
-            if latest is not None:
-                self.current_market_data = latest
             obs = np.zeros(26, dtype=np.float32)
 
         # Get current unrealized PnL

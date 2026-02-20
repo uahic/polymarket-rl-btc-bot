@@ -2,11 +2,16 @@
 Polymarket API helpers for 15-min up/down markets.
 Finds BTC, ETH, SOL, XRP markets using slug pattern.
 """
+
+import sys
 import logging
 import requests
 from datetime import datetime, timezone
-from dataclasses import dataclass
 from typing import List, Optional, Dict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from structures.market import MarketInfo
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -15,20 +20,6 @@ logger = logging.getLogger(__name__)
 
 # 15-min assets (slug pattern: {asset}-updown-15m-{timestamp})
 ASSETS_15M = ["btc", "eth", "sol", "xrp"]
-
-
-@dataclass
-class Market:
-    """Active 15-min prediction market."""
-    condition_id: str
-    question: str
-    asset: str
-    end_time: datetime
-    token_up: str
-    token_down: str
-    price_up: float = 0.5
-    price_down: float = 0.5
-    slug: str = ""
 
 
 def get_market_from_clob(condition_id: str) -> Optional[Dict]:
@@ -40,7 +31,7 @@ def get_market_from_clob(condition_id: str) -> Optional[Dict]:
     return resp.json()
 
 
-def get_15m_markets(assets: List[str] = None) -> List[Market]:
+def get_15m_markets(assets: List[str] = None) -> List[MarketInfo]:
     """
     Get currently active 15-min up/down markets.
 
@@ -50,7 +41,7 @@ def get_15m_markets(assets: List[str] = None) -> List[Market]:
         assets: List of assets (default: btc, eth, sol, xrp)
 
     Returns:
-        List of active Market objects sorted by end time.
+        List of active MarketInfo objects sorted by expiry.
     """
     if assets is None:
         assets = ASSETS_15M
@@ -114,31 +105,24 @@ def get_15m_markets(assets: List[str] = None) -> List[Market]:
                 tokens = clob_data.get("tokens", [])
                 token_up = None
                 token_down = None
-                price_up = 0.5
-                price_down = 0.5
 
                 for t in tokens:
                     outcome = t.get("outcome", "").lower()
                     if outcome == "up":
                         token_up = t.get("token_id")
-                        price_up = t.get("price", 0.5)
                     elif outcome == "down":
                         token_down = t.get("token_id")
-                        price_down = t.get("price", 0.5)
 
                 if not token_up or not token_down:
                     continue
 
-                market = Market(
+                market = MarketInfo(
                     condition_id=condition_id,
-                    question=clob_data.get("question", ""),
                     asset=asset.upper(),
-                    end_time=end_dt,
                     token_up=token_up,
                     token_down=token_down,
-                    price_up=price_up,
-                    price_down=price_down,
-                    slug=slug,
+                    expiry=end_dt.timestamp(),
+                    description=clob_data.get("question", ""),
                 )
                 markets.append(market)
                 break  # Got next market for this asset
@@ -146,12 +130,11 @@ def get_15m_markets(assets: List[str] = None) -> List[Market]:
             except Exception:
                 continue
 
-    # Sort by end time
-    markets.sort(key=lambda m: m.end_time)
+    markets.sort(key=lambda m: m.expiry)
     return markets
 
 
-def get_next_market(asset: str) -> Optional[Market]:
+def get_next_market(asset: str) -> Optional[MarketInfo]:
     """Get the next closing 15-min market for a specific asset."""
     markets = get_15m_markets(assets=[asset])
     return markets[0] if markets else None
@@ -173,11 +156,10 @@ if __name__ == "__main__":
         logger.info("\nNo active 15-min markets found!")
     else:
         for m in markets:
-            mins_left = (m.end_time - now).total_seconds() / 60
+            mins_left = (m.expiry - now.timestamp()) / 60
             logger.info(f"\n{m.asset} 15m")
-            logger.info(f"  {m.question}")
+            logger.info(f"  {m.description}")
             logger.info(f"  Closes in: {mins_left:.1f} min")
-            logger.info(f"  UP: {m.price_up:.3f} | DOWN: {m.price_down:.3f}")
             logger.info(f"  Condition: {m.condition_id}")
             logger.info(f"  Token UP: {m.token_up}")
             logger.info(f"  Token DOWN: {m.token_down}")
