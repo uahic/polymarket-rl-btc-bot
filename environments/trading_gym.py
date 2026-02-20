@@ -115,7 +115,8 @@ class TradingGym(gym.Env):
         Discrete(3): [BUY_UP, HOLD, SELL_DOWN]
 
     Observation Space:
-        Box(26,): Normalized features in [-1, 1] (22 market + 4 time-of-day)
+        Box(N,): Normalized features in [-10, 10] (dynamic based on FeatureConfig)
+        Shape is determined at runtime from FeatureComputer output
 
     Rewards:
         - Terminal reward: Realized P&L when position closes
@@ -163,12 +164,8 @@ class TradingGym(gym.Env):
 
         # Gym spaces
         self.action_space = gym.spaces.Discrete(3)  # BUY_UP, HOLD, SELL_DOWN
-        self.observation_space = gym.spaces.Box(
-            low=-10.0,
-            high=10.0,
-            shape=(26,),
-            dtype=np.float32,
-        )
+        # Observation space will be set dynamically on first reset
+        self.observation_space = None
 
         # Episode state
         self.step_count = 0
@@ -215,6 +212,16 @@ class TradingGym(gym.Env):
 
         # Compute initial observation
         obs = self._get_observation()
+
+        # Initialize observation space if not yet set
+        if self.observation_space is None:
+            self.observation_space = gym.spaces.Box(
+                low=-10.0,
+                high=10.0,
+                shape=obs.shape,
+                dtype=np.float32,
+            )
+            logger.info(f"Observation space initialized: {obs.shape}")
 
         info = {
             "asset": self.current_market_data.asset,

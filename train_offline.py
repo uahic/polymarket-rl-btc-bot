@@ -51,11 +51,14 @@ import json
 from pathlib import Path
 from typing import List, Optional, Any, Dict
 from datetime import datetime
+import yaml
 
 # Environment imports
 from environments.trading_gym import TradingGym
 from data.sources import HistoricalSource
 from features.computer import FeatureComputer
+from features.config_loader import load_full_config
+from features.feature_registry import FeatureConfig
 
 # Import executor wrapper
 from executors.executor_wrapper import GymExecutorWrapper
@@ -97,6 +100,7 @@ def load_training_state(output_path: str) -> Optional[Dict]:
 
 async def train_offline(
     strategy: Any,
+    feature_config: FeatureConfig,
     data_dir: str,
     assets: List[str],
     num_episodes: int,
@@ -109,6 +113,7 @@ async def train_offline(
 
     Args:
         strategy: RL strategy instance (must have act, store, reset methods)
+        feature_config: Feature configuration for FeatureComputer
         data_dir: Directory with historical data
         assets: List of assets to train on
         num_episodes: Number of episodes to train
@@ -173,7 +178,7 @@ async def train_offline(
     )
 
     executor = GymExecutorWrapper(default_order_size=1.0)
-    feature_computer = FeatureComputer()
+    feature_computer = FeatureComputer(feature_config)
 
     env = TradingGym(
         data_source=data_source,
@@ -283,6 +288,20 @@ async def main():
     parser = argparse.ArgumentParser(
         description="Train RL agent on historical market data",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Configuration
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="baseline",
+        help="Feature configuration name (e.g., 'baseline', 'full', 'minimal')",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="ppo_paper_v2",
+        help="Model name for config loading (e.g., 'ppo_paper_v2', 'debug_features')",
     )
 
     # Data arguments
@@ -425,35 +444,86 @@ async def main():
 
     args = parser.parse_args()
 
+    # Load full config from YAML
+    logger.info(f"Loading config '{args.config}' for model '{args.model}'")
+    config_data = load_full_config(args.config, model=args.model)
+
+    # Parse sections
+    feature_config = FeatureConfig.from_yaml_dict(config_data['features'])
+    model_params = config_data['model']
+    training_params = config_data['training']
+
+    # CLI args override YAML
+    if args.hidden_size is not None:
+        model_params['hidden_size'] = args.hidden_size
+    if args.critic_hidden_size is not None:
+        model_params['critic_hidden_size'] = args.critic_hidden_size
+    if args.history_len is not None:
+        model_params['history_len'] = args.history_len
+    if args.temporal_dim is not None:
+        model_params['temporal_dim'] = args.temporal_dim
+    if args.lr_actor is not None:
+        training_params['lr_actor'] = args.lr_actor
+    if args.lr_critic is not None:
+        training_params['lr_critic'] = args.lr_critic
+    if args.gamma is not None:
+        training_params['gamma'] = args.gamma
+    if args.gae_lambda is not None:
+        training_params['gae_lambda'] = args.gae_lambda
+    if args.clip_epsilon is not None:
+        training_params['clip_epsilon'] = args.clip_epsilon
+    if args.entropy_coef is not None:
+        training_params['entropy_coef'] = args.entropy_coef
+    if args.value_coef is not None:
+        training_params['value_coef'] = args.value_coef
+    if args.max_grad_norm is not None:
+        training_params['max_grad_norm'] = args.max_grad_norm
+    if args.buffer_size is not None:
+        training_params['buffer_size'] = args.buffer_size
+    if args.batch_size is not None:
+        training_params['batch_size'] = args.batch_size
+    if args.n_epochs is not None:
+        training_params['n_epochs'] = args.n_epochs
+    if args.target_kl is not None:
+        training_params['target_kl'] = args.target_kl
+
+    logger.info(f"Loaded config: {config_data['name']}")
+    logger.info(f"  {config_data['description']}")
+    logger.info(f"  Enabled features: {feature_config.get_num_enabled()}/26")
+    logger.info(f"  Input mode: {feature_config.input_mode}")
+
     # Import strategy here to avoid issues if imports fail
     from strategies.ppo_paper_v2 import PPOStrategyV2
 
-    # Initialize PPO strategy with parsed arguments
-    logger.info(f"Initializing PPO | actor_hidden={args.hidden_size} critic_hidden={args.critic_hidden_size} history={args.history_len} temporal_dim={args.temporal_dim} lr_actor={args.lr_actor} lr_critic={args.lr_critic} gamma={args.gamma} buffer={args.buffer_size} batch={args.batch_size}")
+    # Initialize PPO strategy with config
+    logger.info(f"Initializing PPO | actor_hidden={model_params['hidden_size']} critic_hidden={model_params['critic_hidden_size']} history={model_params['history_len']} temporal_dim={model_params['temporal_dim']} lr_actor={training_params['lr_actor']} lr_critic={training_params['lr_critic']} gamma={training_params['gamma']} buffer={training_params['buffer_size']} batch={training_params['batch_size']}")
 
     strategy = PPOStrategyV2(
-        input_dim=29,
-        hidden_size=args.hidden_size,
-        critic_hidden_size=args.critic_hidden_size,
-        history_len=args.history_len,
-        temporal_dim=args.temporal_dim,
-        lr_actor=args.lr_actor,
-        lr_critic=args.lr_critic,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_epsilon=args.clip_epsilon,
-        entropy_coef=args.entropy_coef,
-        value_coef=args.value_coef,
-        max_grad_norm=args.max_grad_norm,
-        buffer_size=args.buffer_size,
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        target_kl=args.target_kl,
+        feature_config=feature_config,
+        hidden_size=model_params['hidden_size'],
+        critic_hidden_size=model_params['critic_hidden_size'],
+        history_len=model_params['history_len'],
+        temporal_dim=model_params['temporal_dim'],
+        lr_actor=training_params['lr_actor'],
+        lr_critic=training_params['lr_critic'],
+        gamma=training_params['gamma'],
+        gae_lambda=training_params['gae_lambda'],
+        clip_epsilon=training_params['clip_epsilon'],
+        entropy_coef=training_params['entropy_coef'],
+        value_coef=training_params['value_coef'],
+        max_grad_norm=training_params['max_grad_norm'],
+        buffer_size=training_params['buffer_size'],
+        batch_size=training_params['batch_size'],
+        n_epochs=training_params['n_epochs'],
+        target_kl=training_params['target_kl'],
     )
+
+    logger.info(f"Model input_dim: {strategy.input_dim}")
 
     # Start training
     await train_offline(
         strategy=strategy,
+        feature_config=feature_config,
         data_dir=args.data_dir,
         assets=args.assets,
         num_episodes=args.episodes,

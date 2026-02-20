@@ -5,8 +5,10 @@ from collections import deque
 from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass
+from datetime import datetime
 from .base_strategy import BaseStrategy, MarketState, Action
 from .ml_base_strategy import MLStrategy
+from features.feature_registry import FeatureConfig, FeatureRegistry
 
 import logging
 logger = logging.getLogger(__name__)
@@ -171,22 +173,26 @@ class PPOStrategyV2(MLStrategy):
 
     Key features:
     - GRU temporal encoder: processes ordered state history, capturing velocity/acceleration
-    - Time-of-day features FILTERED OUT in act() method (not used for decisions)
+    - Configurable feature selection via FeatureConfig
     - Asymmetric architecture: larger critic (96) for better value estimation
     - Low gamma (0.9): focuses on near-term rewards for 15-min horizon
     - Larger buffer (2048): diverse experiences for stable gradient updates
 
-    Feature dimensions:
-      Market features:      22  (time-of-day features filtered out)
+    Feature dimensions (dynamic based on config):
+      Market features:      N  (configured via FeatureConfig)
       + previous action:     3  (one-hot)
-      = input_dim:          25
+      = input_dim:          N+3 (auto-calculated)
       Temporal (GRU out):   32
-      Combined:             57
+      Combined:             N+3+32
+
+    Note: MODEL_NAME is explicitly set to 'ppo_paper_v2' (overrides auto-derived 'ppo_strategy_v2').
     """
+
+    MODEL_NAME = "ppo_paper_v2"  # Explicit override (auto-derived would be 'ppo_strategy_v2')
 
     def __init__(
         self,
-        input_dim: int = 25,  # 22 market features + 3 prev action one-hot (time-of-day filtered)
+        feature_config: FeatureConfig,  # REQUIRED - NEW PARAMETER
         hidden_size: int = 64,  # Actor hidden size
         critic_hidden_size: int = 96,  # Larger critic for better value estimation
         history_len: int = 5,  # Number of past states for temporal processing
@@ -205,7 +211,15 @@ class PPOStrategyV2(MLStrategy):
         target_kl: float = 0.02,
     ):
         super().__init__("rl")
-        self.input_dim = input_dim
+
+        # Store feature config
+        self.feature_config = feature_config
+
+        # Auto-calculate input_dim from enabled features
+        num_market_features = feature_config.get_num_enabled()
+        self.input_dim = num_market_features + 3  # + action one-hot
+
+        # Store architecture params
         self.hidden_size = hidden_size
         self.critic_hidden_size = critic_hidden_size
         self.history_len = history_len
@@ -312,16 +326,15 @@ class PPOStrategyV2(MLStrategy):
         """Select action using current policy with temporal context.
 
         Args:
-            features: 26-dimensional base feature vector (22 market + 4 time-of-day)
+            features: Feature vector from FeatureComputer (size depends on config)
 
         Returns:
             Action index (0=BUY_UP, 1=HOLD, 2=SELL_DOWN)
         """
-        # Filter out time-of-day features (last 4 dimensions: hour_sin, hour_cos, dow_sin, dow_cos)
-        # Keep only the 22 market features
-        market_features = features[:22]
+        # NO FILTERING HERE - FeatureComputer already handled it
+        market_features = features
 
-        # Append previous action to features (22 -> 25)
+        # Append previous action to features
         features_with_action = self._append_previous_action(market_features)
 
         # Get temporal state (stacked history of 25-dim states)
@@ -668,6 +681,15 @@ class PPOStrategyV2(MLStrategy):
             'temporal_dim': self.temporal_dim,
             'gamma': self.gamma,
             'buffer_size': self.buffer_size,
+            # NEW: Store feature configuration
+            'feature_config': {
+                'enabled_features': self.feature_config.enabled_features,
+                'input_mode': self.feature_config.input_mode,
+            },
+            # Metadata
+            'model_name': self.MODEL_NAME,
+            'version': 'v2.2',
+            'timestamp': datetime.now().isoformat(),
         }
         torch.save(checkpoint, weights_path)
 
@@ -677,6 +699,40 @@ class PPOStrategyV2(MLStrategy):
 
         # Load checkpoint
         checkpoint = torch.load(weights_path, map_location=self.device)
+
+        # Verify model name
+        if 'model_name' not in checkpoint:
+            raise ValueError(
+                "Checkpoint missing model_name field. "
+                "This is an old checkpoint format (pre-v2.2) that is no longer supported. "
+                "Please retrain your model with the new version."
+            )
+
+        if checkpoint['model_name'] != self.MODEL_NAME:
+            raise ValueError(
+                f"Model name mismatch: checkpoint was saved with '{checkpoint['model_name']}' "
+                f"but attempting to load into '{self.MODEL_NAME}'"
+            )
+
+        # Load feature config from checkpoint
+        if 'feature_config' not in checkpoint:
+            raise ValueError(
+                "Checkpoint missing feature_config. "
+                "This is an old checkpoint format that is no longer supported."
+            )
+
+        saved_config = checkpoint['feature_config']
+
+        # Warn if config differs from current
+        if saved_config != {
+            'enabled_features': self.feature_config.enabled_features,
+            'input_mode': self.feature_config.input_mode,
+        }:
+            logger.warning(
+                "Checkpoint feature config differs from strategy config. "
+                "Using checkpoint config for compatibility."
+            )
+            self.feature_config = FeatureConfig(**saved_config)
 
         # Load model state
         self.actor.load_state_dict(checkpoint['actor_state_dict'])

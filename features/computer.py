@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from features.orderbook_utils import compute_orderbook_imbalance_l1, compute_orderbook_imbalance_l5
+from features.feature_registry import FeatureConfig, FeatureRegistry
 
 
 @dataclass
@@ -125,8 +126,10 @@ class FeatureComputer:
     and refactored to be stateless and testable.
     """
 
-    def __init__(self):
-        """Initialize feature computer."""
+    def __init__(self, feature_config: FeatureConfig):
+        """Initialize feature computer with configuration."""
+        self.feature_config = feature_config
+
         # Feature normalization constants (tuned from historical data)
         self.returns_scale = 50.0  # Typical returns: -0.02 to 0.02
         self.cvd_accel_scale = 10.0  # CVD acceleration is small
@@ -228,7 +231,18 @@ class FeatureComputer:
         f[24] = dow_sin
         f[25] = dow_cos
 
-        return f.copy()
+        # Apply feature selection based on config
+        if self.feature_config.input_mode == "auto_adjust":
+            # Return only enabled features
+            enabled_indices = self.feature_config.get_enabled_indices()
+            return f[enabled_indices].copy()
+        else:  # zero_fill
+            # Return all 26, but zero out disabled
+            result = f.copy()
+            for feat in FeatureRegistry.FEATURES:
+                if not self.feature_config.enabled_features[feat.name]:
+                    result[feat.index] = 0.0
+            return result
 
     def _compute_spread_pct(self, orderbook: OrderbookSnapshot, prob: float) -> float:
         """

@@ -1,0 +1,72 @@
+# Minimal configuration for testing core signal
+name: "minimal"
+description: "Core features only - momentum + position + capital"
+
+features:
+  input_mode: "auto_adjust"
+
+  momentum:
+    returns_1m: true
+    returns_5m: true
+    returns_10m: true
+
+  order_flow:
+    ob_imbalance_l1: false
+    ob_imbalance_l5: false
+    trade_flow: false
+    cvd_accel: false
+
+  microstructure:
+    spread_pct: false
+    trade_intensity: false
+    large_trade_flag: false
+
+  volatility:
+    realized_vol_5m: false
+    vol_expansion: false
+
+  position:
+    has_position: true
+    position_side: true
+    unrealized_pnl: true
+    time_remaining: true
+
+  regime:
+    vol_regime: false
+    trend_regime: false
+
+  transaction:
+    pending_order: false
+    failed_order: false
+    consecutive_failures: false
+
+  capital:
+    available_balance: true
+
+  time_of_day:
+    hour_sin: false
+    hour_cos: false
+    dow_sin: false
+    dow_cos: false
+
+model:
+  hidden_size: 64
+  critic_hidden_size: 96
+  history_len: 5
+  temporal_dim: 32
+
+training:
+  lr_actor: 1.0e-4
+  lr_critic: 3.0e-4
+  gamma: 0.9
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  entropy_coef: 0.03
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  buffer_size: 2048
+  batch_size: 64
+  n_epochs: 10
+  target_kl: 0.02
+
+expected_input_dim: 11  # 8 market + 3 action

@@ -1,0 +1,59 @@
+# Baseline configuration for DebugFeatures
+# Minimal set of features for quick debugging
+
+name: "debug_baseline"
+description: "Minimal feature set for debugging - core features only"
+
+# Feature selection
+features:
+  input_mode: "auto_adjust"  # auto_adjust | zero_fill
+
+  # Individual feature toggles (grouped for readability)
+  momentum:
+    returns_1m: true
+    returns_5m: true
+    returns_10m: true
+
+  order_flow:
+    ob_imbalance_l1: false
+    ob_imbalance_l5: false
+    trade_flow: false
+    cvd_accel: false
+
+  microstructure:
+    spread_pct: true
+    trade_intensity: false
+    large_trade_flag: false
+
+  volatility:
+    realized_vol_5m: true
+    vol_expansion: false
+
+  position:
+    has_position: true
+    position_side: true
+    unrealized_pnl: true
+    time_remaining: true
+
+  regime:
+    vol_regime: false
+    trend_regime: false
+
+  transaction:
+    pending_order: true
+    failed_order: true
+    consecutive_failures: true
+
+  capital:
+    available_balance: true
+
+  time_of_day:
+    hour_sin: false
+    hour_cos: false
+    dow_sin: false
+    dow_cos: false
+
+# Expected dimensions (for validation)
+# 3 momentum + 1 microstructure + 1 volatility + 4 position + 3 transaction + 1 capital = 13 market features
+# + 3 action one-hot = 16 total
+expected_input_dim: 16

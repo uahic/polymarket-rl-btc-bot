@@ -1,0 +1,56 @@
+# Full configuration for DebugFeatures
+# All 26 features enabled for comprehensive testing
+
+name: "debug_full"
+description: "All features enabled for comprehensive debugging"
+
+features:
+  input_mode: "auto_adjust"
+
+  momentum:
+    returns_1m: true
+    returns_5m: true
+    returns_10m: true
+
+  order_flow:
+    ob_imbalance_l1: true
+    ob_imbalance_l5: true
+    trade_flow: true
+    cvd_accel: true
+
+  microstructure:
+    spread_pct: true
+    trade_intensity: true
+    large_trade_flag: true
+
+  volatility:
+    realized_vol_5m: true
+    vol_expansion: true
+
+  position:
+    has_position: true
+    position_side: true
+    unrealized_pnl: true
+    time_remaining: true
+
+  regime:
+    vol_regime: true
+    trend_regime: true
+
+  transaction:
+    pending_order: true
+    failed_order: true
+    consecutive_failures: true
+
+  capital:
+    available_balance: true
+
+  time_of_day:
+    hour_sin: true
+    hour_cos: true
+    dow_sin: true
+    dow_cos: true
+
+# Expected dimensions (for validation)
+# 26 market features + 3 action one-hot = 29 total
+expected_input_dim: 29

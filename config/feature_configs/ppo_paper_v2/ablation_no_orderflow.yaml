@@ -1,0 +1,72 @@
+# Ablation study: Remove order flow features to test importance
+name: "ablation_no_orderflow"
+description: "Baseline minus order flow features"
+
+features:
+  input_mode: "zero_fill"  # Keep input_dim=25, zero-fill disabled
+
+  momentum:
+    returns_1m: true
+    returns_5m: true
+    returns_10m: true
+
+  order_flow:
+    ob_imbalance_l1: false  # DISABLED
+    ob_imbalance_l5: false  # DISABLED
+    trade_flow: false       # DISABLED
+    cvd_accel: false        # DISABLED
+
+  microstructure:
+    spread_pct: true
+    trade_intensity: true
+    large_trade_flag: true
+
+  volatility:
+    realized_vol_5m: true
+    vol_expansion: true
+
+  position:
+    has_position: true
+    position_side: true
+    unrealized_pnl: true
+    time_remaining: true
+
+  regime:
+    vol_regime: true
+    trend_regime: true
+
+  transaction:
+    pending_order: true
+    failed_order: true
+    consecutive_failures: true
+
+  capital:
+    available_balance: true
+
+  time_of_day:
+    hour_sin: false
+    hour_cos: false
+    dow_sin: false
+    dow_cos: false
+
+model:
+  hidden_size: 64
+  critic_hidden_size: 96
+  history_len: 5
+  temporal_dim: 32
+
+training:
+  lr_actor: 1.0e-4
+  lr_critic: 3.0e-4
+  gamma: 0.9
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  entropy_coef: 0.03
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  buffer_size: 2048
+  batch_size: 64
+  n_epochs: 10
+  target_kl: 0.02
+
+expected_input_dim: 29  # Zero-fill mode maintains 26-dim (all features, disabled ones are 0.0) + 3 action
