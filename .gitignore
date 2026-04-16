@@ -37,6 +37,7 @@ htmlcov/
 
 # Models
 models/
+logs/
 
 # Project secrets and generated config
 config.yaml

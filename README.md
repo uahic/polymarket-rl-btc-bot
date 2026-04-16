@@ -1,12 +1,14 @@
 # Polymarket RL BTC Bot
 
-A reinforcement learning trading bot for Polymarket BTC prediction markets. 
+A reinforcement learning trading bot for Polymarket BTC prediction markets (BTC 15-minute up/down markets.
 
 Ships with a simple PPO (Proximal Policy Optimization) implementation with a GRU-based actor-critic to trade 15-minute BTC binary outcome markets on the Polymarket CLOB.
 
 Supports auto-discovery for custom python classes (for other RL implementations/bots) as well.
 
 Supports offline training on historical data and live or paper-mode deployment.
+
+Please note, this repository is work in progress, feel free to contribute :-)
 
 ---
 
