@@ -12,6 +12,7 @@ dist/
 # Virtual environments
 .env*
 .env
+.env.secure
 .env.local
 .env.*.local
 !.env.example
