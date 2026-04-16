@@ -126,8 +126,15 @@ class FeatureComputer:
     and refactored to be stateless and testable.
     """
 
-    def __init__(self, feature_config: FeatureConfig):
+    def __init__(self, feature_config: FeatureConfig = None):
         """Initialize feature computer with configuration."""
+        # Default: all features enabled with auto_adjust mode
+        if feature_config is None:
+            all_features = {feat.name: True for feat in FeatureRegistry.FEATURES}
+            feature_config = FeatureConfig(
+                enabled_features=all_features,
+                input_mode="auto_adjust"
+            )
         self.feature_config = feature_config
 
         # Feature normalization constants (tuned from historical data)

@@ -102,8 +102,8 @@ class OrderExecutor:
         """Get current capital state."""
         raise NotImplementedError
 
-    def compute_position_state(self, current_price: float, time_remaining: float) -> PositionState:
-        """Compute position state with current market price and time remaining."""
+    def compute_position_state(self, market_data: RawMarketData, time_remaining: float) -> PositionState:
+        """Compute position state with current market data and time remaining."""
         raise NotImplementedError
 
 
@@ -188,29 +188,43 @@ class TradingGym(gym.Env):
 
         Args:
             seed: Random seed
-            options: Episode options (asset, start_time, etc.)
+            options: Episode options (asset, start_time, is_first_episode, etc.)
 
         Returns:
             (observation, info)
         """
         super().reset(seed=seed)
 
-        # Reset episode state
-        self.step_count = 0
-        self.pending_rewards = {}
-        self.episode_pnl = 0.0
-        self.episode_fees = 0.0
-        self.episode_trades = 0
-        self.episode_spent = 0.0
-
-        # Reset data source
+        # Extract options
         reset_kwargs = options or {}
-        self.current_market_data = self.data_source.reset(**reset_kwargs)
+        is_first_episode = reset_kwargs.pop("is_first_episode", True)
 
-        # Reset executor
-        self.executor.reset(balance=self.initial_balance)
+        # Always reset step counter
+        self.step_count = 0
 
-        # Compute initial observation
+        if is_first_episode:
+            # Cold reset: new market, reset everything
+            self.pending_rewards = {}
+            self.episode_pnl = 0.0
+            self.episode_fees = 0.0
+            self.episode_trades = 0
+            self.episode_spent = 0.0
+
+            # Reset data source (calls LiveSource.reset())
+            self.current_market_data = self.data_source.reset(**reset_kwargs)
+
+            # Reset executor (clear balance, positions)
+            self.executor.reset(balance=self.initial_balance)
+        else:
+            # Warm reset: keep everything except step counter
+            # DON'T reset data source (market continues)
+            # DON'T reset executor (keep positions, balance)
+            # DON'T reset episode_pnl, episode_trades, etc.
+
+            # Just get current market data (no reset)
+            self.current_market_data = self.data_source.get_current()
+
+        # Compute initial observation (same for both cold/warm reset)
         obs = self._get_observation()
 
         # Initialize observation space if not yet set
@@ -286,16 +300,19 @@ class TradingGym(gym.Env):
         # Get current unrealized PnL
         if self.current_market_data:
             position = self.executor.compute_position_state(
-                current_price=self.current_market_data.prob_up,
+                market_data=self.current_market_data,
                 time_remaining=self.current_market_data.time_remaining,
             )
-            unrealized_pnl = position.unrealized_pnl
+            position_unrealized_pnl = position.unrealized_pnl  # Current position PnL
             has_position = position.has_position
             position_side = position.side
         else:
-            unrealized_pnl = 0.0
+            position_unrealized_pnl = 0.0
             has_position = False
             position_side = None
+
+        # Episode-wide unrealized PnL = episode realized PnL + current position unrealized PnL
+        episode_unrealized_pnl = self.episode_pnl + position_unrealized_pnl
 
         # Info dict
         info = {
@@ -307,7 +324,8 @@ class TradingGym(gym.Env):
             "filled": result.filled,
             "pnl": result.pnl,
             "balance": result.balance,
-            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pnl": episode_unrealized_pnl,  # Episode-wide PnL (realized + unrealized)
+            "position_unrealized_pnl": position_unrealized_pnl,  # Current position PnL only
             "has_position": has_position,
             "position_side": position_side,
             "episode_pnl": self.episode_pnl,
@@ -328,9 +346,9 @@ class TradingGym(gym.Env):
         Returns:
             26-dimensional feature vector (22 market + 4 time-of-day)
         """
-        # Get agent-dependent state with current market price
+        # Get agent-dependent state with current market data
         position = self.executor.compute_position_state(
-            current_price=self.current_market_data.prob_up,
+            market_data=self.current_market_data,
             time_remaining=self.current_market_data.time_remaining,
         )
 
@@ -386,7 +404,7 @@ class TradingGym(gym.Env):
         if self.shaping_reward_coef > 0 and self.current_market_data:
             # Compute position state with current market data to get actual unrealized PnL
             position = self.executor.compute_position_state(
-                current_price=self.current_market_data.prob_up,
+                market_data=self.current_market_data,
                 time_remaining=self.current_market_data.time_remaining,
             )
             # Add positive or negative reward, weighted by a tiny coefficient to combat sparse rewards

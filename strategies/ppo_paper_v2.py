@@ -242,9 +242,9 @@ class PPOStrategyV2(MLStrategy):
 
         # Networks with temporal processing
         self.actor = Actor(
-            input_dim, hidden_size, self.output_dim, history_len, temporal_dim
+            self.input_dim, hidden_size, self.output_dim, history_len, temporal_dim
         )
-        self.critic = Critic(input_dim, critic_hidden_size, history_len, temporal_dim)
+        self.critic = Critic(self.input_dim, critic_hidden_size, history_len, temporal_dim)
 
         # Optimizers
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
@@ -481,6 +481,8 @@ class PPOStrategyV2(MLStrategy):
         if len(self.experiences) < self.buffer_size:
             return None
 
+        logger.info(f"[PPO] Starting update | Buffer: {len(self.experiences)}/{self.buffer_size} | Device: {self.device}")
+
         # Move networks to training device (GPU if available) for batch training
         self.actor.to(self.device)
         self.critic.to(self.device)
@@ -510,10 +512,26 @@ class PPOStrategyV2(MLStrategy):
 
         # Compute advantages and returns
         advantages, returns = self._compute_gae(rewards, old_values, dones, next_value)
+
+        # Log reward statistics before cleaning up
+        reward_mean = rewards.mean()
+        reward_std = rewards.std()
+        reward_min = rewards.min()
+        reward_max = rewards.max()
+        logger.info(
+            f"[PPO] Rewards | Mean: {reward_mean:+.4f} | Std: {reward_std:.4f} | "
+            f"Range: [{reward_min:+.4f}, {reward_max:+.4f}]"
+        )
+
         del rewards, dones
 
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        logger.info(
+            f"[PPO] Advantages | Mean: 0.0000 (normalized) | Std: 1.0000 (normalized) | "
+            f"Returns mean: {returns.mean():+.4f}"
+        )
 
         # Compute explained variance before converting to tensors (needs numpy arrays)
         var_y = np.var(returns)
@@ -544,6 +562,8 @@ class PPOStrategyV2(MLStrategy):
             "approx_kl": [],
             "clip_fraction": [],
         }
+
+        logger.info(f"[PPO] Starting {self.n_epochs} epochs | Batch size: {self.batch_size} | Samples: {n_samples}")
 
         # Multiple epochs over the data
         for epoch in range(self.n_epochs):
@@ -627,8 +647,24 @@ class PPOStrategyV2(MLStrategy):
 
             # Early stopping on KL divergence
             avg_kl = epoch_kl / max(1, n_batches)
+
+            # Log epoch summary
+            epoch_policy_loss = np.mean([all_metrics["policy_loss"][i] for i in range(-n_batches, 0)])
+            epoch_value_loss = np.mean([all_metrics["value_loss"][i] for i in range(-n_batches, 0)])
+            epoch_entropy = np.mean([all_metrics["entropy"][i] for i in range(-n_batches, 0)])
+            epoch_clip_frac = np.mean([all_metrics["clip_fraction"][i] for i in range(-n_batches, 0)])
+
+            logger.info(
+                f"[PPO] Epoch {epoch+1}/{self.n_epochs} | "
+                f"Policy Loss: {epoch_policy_loss:.4f} | "
+                f"Value Loss: {epoch_value_loss:.4f} | "
+                f"Entropy: {epoch_entropy:.4f} | "
+                f"KL: {avg_kl:.4f} | "
+                f"Clip%: {epoch_clip_frac*100:.1f}%"
+            )
+
             if avg_kl > self.target_kl:
-                logger.info(f"[RL] Early stop epoch {epoch}, KL={avg_kl:.4f}")
+                logger.info(f"[PPO] ⚠️  Early stopping at epoch {epoch+1} | KL divergence {avg_kl:.4f} > target {self.target_kl:.4f}")
                 break
 
         # Clear buffer after update
@@ -650,7 +686,29 @@ class PPOStrategyV2(MLStrategy):
             "explained_variance": explained_var,
         }
 
+        # Final summary
+        logger.info(
+            f"[PPO] ✓ Update complete | "
+            f"Avg Policy Loss: {metrics['policy_loss']:.4f} | "
+            f"Avg Value Loss: {metrics['value_loss']:.4f} | "
+            f"Avg Entropy: {metrics['entropy']:.4f} | "
+            f"Avg KL: {metrics['approx_kl']:.4f} | "
+            f"Explained Var: {metrics['explained_variance']:.3f}"
+        )
+
         return metrics
+
+    def train(self):
+        """Set to training mode."""
+        super().train()
+        self.actor.train()
+        self.critic.train()
+
+    def eval(self):
+        """Set to evaluation mode."""
+        super().eval()
+        self.actor.eval()
+        self.critic.eval()
 
     def reset(self):
         """Clear experience buffer and state history for new episode."""

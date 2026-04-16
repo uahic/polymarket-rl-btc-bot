@@ -60,30 +60,51 @@ action_color_dict = {
     Action.SELL: f"{Colors.BOLD}{Colors.RED}SELL{Colors.RESET}",
 }
 
+position_color_dict = {
+    "UP": f"{Colors.BOLD}{Colors.GREEN}UP{Colors.RESET}",
+    "DOWN": f"{Colors.BOLD}{Colors.RED}DOWN{Colors.RESET}",
+    "None": f"{Colors.BOLD}{Colors.GRAY}None{Colors.RESET}",
+}
+
 
 def log_run_episode(
-    step_count, action: Action, prev_pnl, reward, info: Dict[str, Any]
+    step_count, action: Action, prev_position_pnl, reward, info: Dict[str, Any]
 ) -> None:
-    current_pnl = info.get("unrealized_pnl", 0)
-    delta_pnl = current_pnl - prev_pnl
+    episode_pnl = info.get("unrealized_pnl", 0)  # Episode-wide PnL
+    position_pnl = info.get("position_unrealized_pnl", 0)  # Current position PnL
+    delta_position_pnl = position_pnl - prev_position_pnl
     amount_spent = info.get("amount_spent", 0)
     realized_pnl = info.get("pnl", 0)
     has_position = info.get("has_position", False)
     position_side = info.get("position_side", None)
+    balance = info.get('balance', 0)
 
-    # Build log message
+    # Build log message with fixed-width columns
+    # Pad action manually since colored strings don't respect format width
+    action_str = action_color_dict[action]
+    # BUY=3, SELL=4, HOLD=4 chars - pad to 4 chars visually
+    action_padding = " " if action == Action.BUY else ""
+
     log_msg = (
         f"Step {step_count:4d} | "
-        f"Action: {action_color_dict[action]:4s} | "
-        f"Reward: {reward:+.4f} | "
-        f"Balance: ${info.get('balance', 0):.2f}"
+        f"Action: {action_str}{action_padding} | "
+        f"Reward: {reward:+7.4f} | "
+        f"Balance: ${balance:8.2f}"
     )
 
-    # Add position info
+    # Add position info - show both episode and position PnL with fixed widths
     if has_position:
-        log_msg += f" | Pos: {position_side} | UPnL: ${current_pnl:+.2f} | Δ: ${delta_pnl:+.2f}"
+        # Color-code position and pad manually (UP=2 chars, DOWN=4 chars -> pad to 4)
+        pos_colored = position_color_dict.get(position_side, position_side)
+        pos_padding = "  " if position_side == "UP" else ""  # UP needs 2 spaces to match DOWN
+        log_msg += (
+            f" | Pos: {pos_colored}{pos_padding} | "
+            f"Pos UPnL: ${position_pnl:+8.2f} (Δ: ${delta_position_pnl:+7.2f}) | "
+            f"Ep UPnL: ${episode_pnl:+8.2f}"
+        )
     else:
-        log_msg += f" | Pos: FLAT"
+        # None is 4 chars, no padding needed
+        log_msg += f" | Pos: {position_color_dict['None']} | Ep UPnL: ${episode_pnl:+8.2f}"
 
     # Add trade info (distinguish between open, close, and hold)
     rejection_reason = info.get("rejection_reason", "") or ""
@@ -95,13 +116,16 @@ def log_run_episode(
         log_msg += f" | 🚫 REDUNDANT {action.name} | Penalty: ${realized_pnl:+.2f}"
     elif realized_pnl != 0 and amount_spent > 0:
         # Closed old position AND opened new one (switched positions)
-        log_msg += f" | 🔄 SWITCHED | Realized: ${realized_pnl:+.2f} | Spent: ${amount_spent:.2f}"
+        log_msg += f" | 🔄 SWITCHED | Realized: ${realized_pnl:+8.2f} | Opened: ${amount_spent:8.2f}"
+    elif realized_pnl != 0 and not info.get("filled", False):
+        # Closed position but failed to open new one (ended up flat)
+        log_msg += f" | ⚠️  CLOSED ONLY | Realized: ${realized_pnl:+8.2f} | Reopen failed: {rejection_reason}"
     elif realized_pnl != 0:
         # Just closed position
-        log_msg += f" | ✓ CLOSED | Realized: ${realized_pnl:+.2f}"
+        log_msg += f" | ✓ CLOSED | Realized: ${realized_pnl:+8.2f}"
     elif amount_spent > 0 and info.get("filled", False):
         # Just opened position
-        log_msg += f" | ✓ OPENED | Spent: ${amount_spent:.2f}"
+        log_msg += f" | ✓ OPENED | Size: ${amount_spent:8.2f}"
     elif not info.get("filled", False):
         # Trade was rejected
         log_msg += f" | ❌ REJECTED: {rejection_reason}"
@@ -128,6 +152,7 @@ class GymTradingRunner:
         assets: List[str] = None,
         max_episode_steps: int = _rcfg_runner.get("max_episode_steps", 1800),
         enable_dashboard: bool = _rcfg_runner.get("enable_dashboard", False),
+        feature_config=None,
     ):
         """
         Initialize gym trading runner.
@@ -140,6 +165,7 @@ class GymTradingRunner:
             assets: List of assets to track (default: ["BTC"])
             max_episode_steps: Maximum steps per episode (default: 1800 = 15min @ 500ms)
             enable_dashboard: Enable professional dashboard integration
+            feature_config: FeatureConfig for feature computation (default: baseline)
         """
         self.strategy_factory = strategy_factory
         self.config = config
@@ -148,6 +174,7 @@ class GymTradingRunner:
         self.assets = assets or _rcfg_runner.get("assets", ["BTC"])
         self.max_episode_steps = max_episode_steps
         self.enable_dashboard = enable_dashboard
+        self.feature_config = feature_config
 
         # State
         self.strategies: Dict[str, any] = {}  # asset → strategy instance
@@ -212,8 +239,8 @@ class GymTradingRunner:
             tick_interval=_rcfg_streams.get("tick_interval", 0.5),
         )
 
-        # Create feature computer
-        feature_computer = FeatureComputer()
+        # Create feature computer with the same config as the strategy
+        feature_computer = FeatureComputer(feature_config=self.feature_config)
 
         logger.info("All systems ready")
 
@@ -221,6 +248,7 @@ class GymTradingRunner:
         while True:
             # Discover active markets
             markets = get_15m_markets(assets=self.assets)
+            logger.info(f"Discovered {len(markets)} active market(s) for {self.assets}")
 
             # Subscribe to orderbook streams for discovered markets first,
             # then clean up stale subscriptions. This order ensures the current
@@ -234,6 +262,11 @@ class GymTradingRunner:
             # Clean up stale orderbook subscriptions for expired markets
             active_condition_ids = {market.condition_id for market in markets}
             self.orderbook_streamer.clear_stale(active_condition_ids)
+
+            if not markets:
+                logger.warning(f"No active markets found for {self.assets}. Retrying in {_rcfg_loop.get('market_discovery_interval_seconds', 10)}s...")
+                await asyncio.sleep(_rcfg_loop.get("market_discovery_interval_seconds", 10))
+                continue
 
             for market in markets:
                 asset = market.asset
@@ -275,39 +308,79 @@ class GymTradingRunner:
                 # _get_strategy calls the strategy_factory passed to this class instance
                 strategy = self._get_strategy(asset)
 
-                # Run episode for this market
-                await self._run_episode(env, strategy, market)
+                # Run MULTIPLE episodes for this market
+                # Note: is_done() check happens AFTER first episode reset
+                # Detect if this is a new market by comparing condition_id
+                is_new_market = (
+                    not hasattr(self, '_last_market_id') or
+                    self._last_market_id != market.condition_id
+                )
+                is_first_episode = is_new_market
+                market_expired = False
+
+                # Track this market for next iteration
+                self._last_market_id = market.condition_id
+
+                # Run at least one episode, then check if market expired
+                while True:
+                    # Run one episode
+                    market_expired = await self._run_episode(
+                        env, strategy, market, is_first_episode
+                    )
+
+                    is_first_episode = False
+
+                    if market_expired or live_source.is_done():
+                        # Market expired during or after episode
+                        logger.info(f"Market {market.condition_id} expired")
+                        break
 
             # Wait before next market discovery
             await asyncio.sleep(_rcfg_loop.get("market_discovery_interval_seconds", 10))
 
     async def _run_episode(
-        self, env: TradingGym, strategy: BaseStrategy, market: MarketInfo
+        self, env: TradingGym, strategy: BaseStrategy, market: MarketInfo, is_first_episode: bool = True
     ):
         """
-        Run one episode (one market) using gym interface.
+        Run one RL episode.
 
         Args:
             env: TradingGym environment
             strategy: Strategy instance
             market: Market information
+            is_first_episode: If True, this is the first episode for this market (cold reset)
+
+        Returns:
+            True if market expired during episode, False otherwise
         """
+        # Pretty multiline episode header
         logger.info(
-            f"Starting episode: {market.asset} | Market: {market.description[:60]}... | ID: {market.condition_id} | Expiry: {time.strftime('%H:%M:%S', time.localtime(market.expiry))}"
+            f"\n{'='*80}\n"
+            f"  Episode {self.episode_count + 1} | {market.asset} | {'NEW MARKET' if is_first_episode else 'WARM RESET'}\n"
+            f"  Market: {market.description[:60]}...\n"
+            f"  ID: {market.condition_id}\n"
+            f"{'='*80}"
         )
 
-        # Reset environment and strategy
+        # Reset environment
         obs, info = env.reset(
-            options={"asset": market.asset, "market_id": market.condition_id}
+            options={
+                "asset": market.asset,
+                "market_id": market.condition_id,
+                "is_first_episode": is_first_episode
+            }
         )
-        strategy.reset()
+
+        # Only reset strategy on first episode of a new market
+        if is_first_episode:
+            strategy.reset()
 
         done = False  # Episode done?
         truncated = False  # Episode truncated?
         step_count = 0
         episode_reward = 0.0
         # prev_obs = obs
-        prev_pnl = 0.0  # Track previous PnL for delta calculation
+        prev_position_pnl = 0.0  # Track previous position PnL for delta calculation
 
         # Track trades for dashboard
         episode_trades = 0
@@ -360,8 +433,8 @@ class GymTradingRunner:
 
             # Logging
             if step_count % _rcfg_logging.get("log_frequency_steps", 1) == 0:
-                log_run_episode(step_count, action, prev_pnl, reward, info)
-                prev_pnl = info.get("unrealized_pnl", 0)
+                log_run_episode(step_count, action, prev_position_pnl, reward, info)
+                prev_position_pnl = info.get("position_unrealized_pnl", 0)
 
             obs = next_obs
 
@@ -371,7 +444,12 @@ class GymTradingRunner:
         # Episode complete
         final_pnl = info.get("episode_pnl", 0.0)
         final_balance = info.get("balance", 0.0)
-        total_spent = info.get("episode_spent", 0.0)
+        initial_balance = (
+            _rcfg_env.get("paper_initial_balance", 1000.0)
+            if self.mode == "paper"
+            else _rcfg_env.get("live_initial_balance", 100.0)
+        )
+        episode_profit = final_balance - initial_balance
 
         # Update cumulative stats
         self.cumulative_pnl += final_pnl
@@ -384,8 +462,15 @@ class GymTradingRunner:
             self._update_dashboard_episode(episode_reward, step_count)
 
         logger.info(
-            f"Episode complete: {market.asset} | Steps: {step_count} | Reward: {episode_reward:.4f} | Balance: ${final_balance:.2f} | PnL: ${final_pnl:+.2f} | Spent: ${total_spent:.2f} | Cumulative PnL: ${self.cumulative_pnl:+.2f}"
+            f"Episode complete | Steps: {step_count} | "
+            f"Reason: {'MARKET EXPIRED' if done else 'TRUNCATED'} | "
+            f"Reward: {episode_reward:.4f} | "
+            f"Episode Profit: ${episode_profit:+.2f} (Balance: ${final_balance:.2f}) | "
+            f"Cumulative PnL: ${self.cumulative_pnl:+.2f}"
         )
+
+        # Return True if market expired (done=True), False if just truncated
+        return done
 
 
     def _get_strategy(self, asset: str):

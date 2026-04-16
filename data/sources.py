@@ -525,8 +525,8 @@ class LiveSource(DataSource):
         # Current market state
         self.current_asset = None
         self.current_market = None
-        self.episode_start_time = None
-        self.episode_duration = 900.0  # 15 minutes
+        self.market_start_time = None
+        self.market_duration = 900.0  # 15 minutes
 
         # History tracking
         self.prob_history: deque = deque(maxlen=50)
@@ -546,8 +546,8 @@ class LiveSource(DataSource):
         self.current_market = market_id
         self.prob_history = deque(maxlen=50)
 
-        # Start episode timer
-        self.episode_start_time = time.time()
+        # Start market timer
+        self.market_start_time = time.time()
 
         return self.get_current()
 
@@ -600,9 +600,9 @@ class LiveSource(DataSource):
             change_pct=0.0,  # Not used in features
         )
 
-        # Calculate time remaining
-        elapsed = timestamp - self.episode_start_time
-        time_remaining = max(0.0, 1.0 - (elapsed / self.episode_duration))
+        # Calculate time remaining in market
+        elapsed = timestamp - self.market_start_time
+        time_remaining = max(0.0, 1.0 - (elapsed / self.market_duration))
 
         # Current probability (from orderbook mid price), clamped to valid range
         prob_up = max(0.0, min(1.0, orderbook.mid_price))
@@ -642,8 +642,8 @@ class LiveSource(DataSource):
         Returns:
             True if 15 minutes elapsed
         """
-        if self.episode_start_time is None:
+        if self.market_start_time is None:
             return True
 
-        elapsed = time.time() - self.episode_start_time
-        return elapsed >= self.episode_duration
+        elapsed = time.time() - self.market_start_time
+        return elapsed >= self.market_duration

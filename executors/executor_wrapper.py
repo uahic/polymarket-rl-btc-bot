@@ -118,7 +118,41 @@ class GymExecutorWrapper(OrderExecutor):
                     self.consecutive_failures += 1
                     return close_result
 
-        # Open new position
+                # Close succeeded - try to open new position
+                if action_idx == Action.BUY:  # BUY_UP
+                    open_result = self._open_position("BUY", market_data, action.size)
+                elif action_idx == Action.SELL:  # SELL_DOWN (buy DOWN token)
+                    open_result = self._open_position("SELL", market_data, action.size)
+                else:
+                    raise ValueError(f"Invalid action: {action_idx}")
+
+                # If open failed, preserve close PnL in the result
+                if not open_result.filled:
+                    return ExecutionResult(
+                        success=False,
+                        filled=False,
+                        balance=open_result.balance,
+                        position=None,  # Position was closed
+                        pnl=close_result.pnl,  # Preserve realized PnL from close
+                        fee=close_result.fee,
+                        slippage=close_result.slippage,
+                        amount_spent=0.0,
+                        rejection_reason=open_result.rejection_reason,
+                    )
+
+                # Both close and open succeeded - combine PnLs
+                return ExecutionResult(
+                    success=True,
+                    filled=True,
+                    balance=open_result.balance,
+                    position=open_result.position,
+                    pnl=close_result.pnl,  # Return close PnL (open PnL is 0 anyway)
+                    fee=close_result.fee + open_result.fee,
+                    slippage=close_result.slippage + open_result.slippage,
+                    amount_spent=open_result.amount_spent,
+                )
+
+        # Open new position (no existing position to close)
         if action_idx == Action.BUY:  # BUY_UP
             return self._open_position("BUY", market_data, action.size)
         elif action_idx == Action.SELL:  # SELL_DOWN (buy DOWN token)
@@ -297,12 +331,12 @@ class GymExecutorWrapper(OrderExecutor):
             time_remaining_normalized=0.0,  # Computed by environment
         )
 
-    def compute_position_state(self, current_price: float, time_remaining: float) -> PositionState:
+    def compute_position_state(self, market_data: RawMarketData, time_remaining: float) -> PositionState:
         """
         Compute position state with current market data.
 
         Args:
-            current_price: Current market price (prob_up)
+            market_data: Current market data with orderbook prices
             time_remaining: Time remaining in episode [0, 1]
 
         Returns:
@@ -316,8 +350,16 @@ class GymExecutorWrapper(OrderExecutor):
                 time_remaining_normalized=time_remaining,
             )
 
-        # Compute unrealized P&L
-        unrealized_pnl = self.current_position.compute_pnl(current_price)
+        # Compute unrealized P&L using actual exit price (what we'd get if we closed now)
+        # This properly accounts for bid-ask spread
+        if self.current_position.side == "UP":
+            # For UP position, we'd sell at the bid price
+            exit_price = market_data.orderbook.best_bid if market_data.orderbook.best_bid is not None else market_data.prob_up
+        else:  # DOWN
+            # For DOWN position, we'd sell at (1 - ask)
+            exit_price = (1 - market_data.orderbook.best_ask) if market_data.orderbook.best_ask is not None else (1 - market_data.prob_up)
+
+        unrealized_pnl = self.current_position.compute_pnl(exit_price)
 
         return PositionState(
             has_position=True,

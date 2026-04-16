@@ -213,10 +213,11 @@ class MockOrderExecutor:
             rejection_reason=None,
         )
 
-    def compute_position_state(self, current_price: float, time_remaining: float) -> PositionState:
+    def compute_position_state(self, market_data: RawMarketData, time_remaining: float) -> PositionState:
         """Compute current position state."""
         if self.position:
-            unrealized_pnl = (current_price - self.position_entry_price) * 10
+            # Use prob_up for mock (tests don't have realistic orderbook)
+            unrealized_pnl = (market_data.prob_up - self.position_entry_price) * 10
             return PositionState(
                 has_position=True,
                 side=self.position,
@@ -233,7 +234,17 @@ class MockOrderExecutor:
 
     def get_position_state(self) -> PositionState:
         """Get position state."""
-        return self.compute_position_state(0.5, 0.5)
+        # Create a simple mock market data for the get_position_state call
+        from features.computer import RawMarketData, OrderbookData, FuturesData
+        mock_market_data = RawMarketData(
+            asset="BTC",
+            timestamp=0.0,
+            prob_up=0.5,
+            orderbook=OrderbookData(best_bid=None, best_ask=None, spread=None),
+            futures=FuturesData(trade_flow_imbalance=0.0),
+            time_remaining=0.5,
+        )
+        return self.compute_position_state(mock_market_data, 0.5)
 
     def get_transaction_state(self) -> TransactionState:
         """Get transaction state."""

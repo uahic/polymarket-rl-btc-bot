@@ -400,7 +400,7 @@ class LiveOrderExecutor(OrderExecutor):
         )
 
     def compute_position_state(
-        self, current_price: float, time_remaining: float
+        self, market_data: RawMarketData, time_remaining: float
     ) -> PositionState:
         """Compute position state with current market data for PnL calculation."""
         if self.current_position is None:
@@ -411,7 +411,16 @@ class LiveOrderExecutor(OrderExecutor):
                 time_remaining_normalized=time_remaining,
             )
 
-        unrealized_pnl = self.current_position.compute_pnl(current_price)
+        # Compute unrealized P&L using actual exit price (what we'd get if we closed now)
+        # This properly accounts for bid-ask spread
+        if self.current_position.side == "UP":
+            # For UP position, we'd sell at the bid price
+            exit_price = market_data.orderbook.best_bid if market_data.orderbook.best_bid is not None else market_data.prob_up
+        else:  # DOWN
+            # For DOWN position, we'd sell at (1 - ask)
+            exit_price = (1 - market_data.orderbook.best_ask) if market_data.orderbook.best_ask is not None else (1 - market_data.prob_up)
+
+        unrealized_pnl = self.current_position.compute_pnl(exit_price)
 
         return PositionState(
             has_position=True,

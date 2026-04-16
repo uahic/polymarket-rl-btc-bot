@@ -14,7 +14,7 @@ class Position:
     def entry_value(self) -> float:
         return self.entry_price * self.shares
 
-    def compute_pnl(self, current_price: float) -> float:
+    def compute_pnl(self, current_token_price: float) -> float:
         """
         Compute unrealized P&L.
 
@@ -23,19 +23,13 @@ class Position:
         - DOWN token: profit when price decreases
 
         Args:
-            current_price: Current UP token probability (prob_up)
+            current_token_price: Current price of the token we hold
+                                 (For UP: this is prob_up or best_bid)
+                                 (For DOWN: this is (1-prob_up) or (1-best_ask))
         """
-        if self.side == "UP":
-            # UP token value increases with probability
-            current_value = current_price * self.shares
-            return current_value - self.entry_value
-        else:  # DOWN
-            # DOWN token value is inverse
-            # When we bought DOWN, we paid (1 - up_prob) per share
-            # Current value is (1 - current_up_prob) per share
-            current_down_price = 1.0 - current_price
-            current_value = current_down_price * self.shares
-            return current_value - self.entry_value
+        # Simple calculation: current value - entry value
+        current_value = current_token_price * self.shares
+        return current_value - self.entry_value
 
 
 @dataclass

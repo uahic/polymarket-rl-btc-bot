@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from strategies import ALL_STRATEGIES, registry, MLStrategy
 from config_loader import load_config
 from trading_runner import GymTradingRunner
+from features.feature_registry import FeatureRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ async def main():
     parser.add_argument("--port", type=int, default=5050, help="Dashboard port")
     parser.add_argument("--live", action="store_true", help="Enable live trading mode")
     parser.add_argument("--episode-length", type=int, default=1800, help="Maximum steps per episode (default: 1800 = 15min @ 500ms)")
+    parser.add_argument("--feature-config", type=str, default=None, help="Path to feature config YAML (default: baseline 22 features)")
 
     args = parser.parse_args()
 
@@ -58,6 +60,14 @@ async def main():
 
     # Load config file from ./config.yaml
     config = load_config()
+
+    # Load feature config
+    if args.feature_config:
+        feature_config = FeatureRegistry.from_yaml(args.feature_config)
+        logger.info(f"Loaded feature config from {args.feature_config}")
+    else:
+        feature_config = FeatureRegistry.get_baseline_config()
+        logger.info("Using baseline feature config (22 features, no time-of-day)")
 
     # Start dashboard if requested
     dashboard_thread = None
@@ -78,13 +88,14 @@ async def main():
     # Use gym-based runner
     mode = "live" if args.live else "paper"
     runner = GymTradingRunner(
-        strategy_factory=lambda: create_strategy(args),
+        strategy_factory=lambda: create_strategy(args, feature_config),
         config=config,
         mode=mode,
         trade_size=args.size,
         assets=["BTC"],  # TODO: Make configurable
         max_episode_steps=args.episode_length,
         enable_dashboard=args.dashboard,
+        feature_config=feature_config,
     )
 
     # Setup signal handler for graceful shutdown with auto-save
@@ -131,9 +142,19 @@ def find_latest_model(strategy_name: str) -> str | None:
     return str(candidates[-1]) if candidates else None
 
 
-def create_strategy(args):
-    """Create strategy instance with proper configuration."""
-    strategy = registry.create(args.strategy)
+def create_strategy(args, feature_config):
+    """Create strategy instance with proper configuration.
+
+    Args:
+        args: Command-line arguments
+        feature_config: FeatureConfig instance to use for the strategy
+    """
+    # Try creating with feature_config first, fall back to no params if not needed
+    try:
+        strategy = registry.create(args.strategy, feature_config=feature_config)
+    except TypeError:
+        # Strategy doesn't need feature_config parameter
+        strategy = registry.create(args.strategy)
 
     # Setup ML-based strategy
     if isinstance(strategy, MLStrategy):
